@@ -108,7 +108,9 @@ fn callback_list(mut cursor: u64, image: &[u8], base: u64) -> Result<Vec<u64>, L
             break;
         }
         found.push(target);
-        cursor += 8;
+        cursor = cursor
+            .checked_add(8)
+            .ok_or_else(|| LoadError::Tls("TLS callback array wraps around".into()))?;
     }
     Ok(found)
 }
@@ -118,4 +120,21 @@ fn inside(address: u64, base: u64, size: u64, length: u64) -> bool {
         && address
             .checked_add(length)
             .is_some_and(|end| end <= base.saturating_add(size))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_callback_array_at_the_top_of_the_address_space_is_refused() {
+        // Base near u64::MAX: the walk must stop with an error, not overflow.
+        let base = u64::MAX - 15;
+        let mut image = vec![0u8; 16];
+        image[8..16].copy_from_slice(&1u64.to_le_bytes());
+        assert!(matches!(
+            callback_list(base + 8, &image, base),
+            Err(LoadError::Tls(_))
+        ));
+    }
 }

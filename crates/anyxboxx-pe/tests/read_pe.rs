@@ -204,3 +204,24 @@ fn pages_take_the_section_rights() {
             .all(|&p| p == PROT_READ | PROT_WRITE | PROT_EXEC)
     );
 }
+
+#[test]
+fn a_malformed_relocation_block_is_refused_not_skipped() {
+    const DIRECTORIES: usize = 0x80 + 4 + 20 + 112;
+    const DIR_RELOC: usize = 5;
+    const HEADERS_SIZE: usize = 0x400;
+    let pe = Pe {
+        pointers: vec![(0x80, 0x10)],
+        ..Pe::default()
+    };
+    let (mut file, _) = pe.build();
+    let at = DIRECTORIES + 8 * DIR_RELOC;
+    let table_rva = u32::from_le_bytes(file[at..at + 4].try_into().unwrap()) as usize;
+    let block = table_rva - common::SECTION_RVA as usize + HEADERS_SIZE;
+    // SizeOfBlock smaller than the block header: pefile stopped there and left the pointer as is.
+    file[block + 4..block + 8].copy_from_slice(&6u32.to_le_bytes());
+    assert!(matches!(
+        read_pe(&file, forced(MOVED)),
+        Err(LoadError::Relocation(_))
+    ));
+}

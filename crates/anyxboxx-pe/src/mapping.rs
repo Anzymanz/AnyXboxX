@@ -52,15 +52,31 @@ fn copy_section(data: &[u8], section: &Section, image: &mut [u8]) -> Result<(), 
 }
 
 /// `(rva, type)` of every base relocation entry, from the relocation directory of `image`.
-pub fn relocations(image: &[u8], headers: &Headers) -> Vec<(usize, u16)> {
+///
+/// A block with `SizeOfBlock == 0` ends the table (pefile stops there too). Any other malformed
+/// block (shorter than its header, or running past the directory or the image) is an error:
+/// pefile only warned and dropped the rest of the table, which would leave pointers unrelocated.
+pub fn relocations(image: &[u8], headers: &Headers) -> Result<Vec<(usize, u16)>, LoadError> {
     let (rva, size) = headers.directory(DIR_RELOC);
     let mut found = Vec::new();
-    let (mut at, end) = (rva as usize, (rva as usize).saturating_add(size as usize));
-    while size != 0 && at + RELOC_BLOCK_HEADER <= end.min(image.len()) {
+    if size == 0 {
+        return Ok(found);
+    }
+    let (mut at, end) = (rva as usize, rva as usize + size as usize);
+    if end > image.len() {
+        return Err(LoadError::Relocation("table outside the image".into()));
+    }
+    while at < end {
+        if at + RELOC_BLOCK_HEADER > end {
+            return Err(LoadError::Relocation(format!("truncated block at {at:#x}")));
+        }
         let page = read_u32(image, at) as usize;
         let block = read_u32(image, at + 4) as usize;
-        if block < RELOC_BLOCK_HEADER || at + block > end.min(image.len()) {
+        if block == 0 {
             break;
+        }
+        if block < RELOC_BLOCK_HEADER || at + block > end {
+            return Err(LoadError::Relocation(format!("malformed block at {at:#x}")));
         }
         // A dangling odd byte at the end of a block is not an entry.
         for entry in (at + RELOC_BLOCK_HEADER..at + block - 1).step_by(2) {
@@ -69,7 +85,7 @@ pub fn relocations(image: &[u8], headers: &Headers) -> Vec<(usize, u16)> {
         }
         at += block;
     }
-    found
+    Ok(found)
 }
 
 /// Adds `delta` to every relocated field; an unknown relocation type is an error, never skipped.

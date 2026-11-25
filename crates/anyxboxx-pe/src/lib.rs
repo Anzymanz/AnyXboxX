@@ -122,7 +122,7 @@ where
     check(&headers)?;
     let info = ImageInfo::parse(data)?;
     let mut mapped = mapping::map(data, &headers)?;
-    let relocations = mapping::relocations(&mapped, &headers);
+    let relocations = mapping::relocations(&mapped, &headers)?;
     let size = align(u64::from(headers.size_of_image));
     let base = allocate(
         usable(headers.image_base, size),
