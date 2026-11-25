@@ -5809,7 +5809,17 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        // Texture refreshes wait here to be done together
+        // (`crate::texture::refresh_all`, VICTORY_TEXTURE_BATCH=1): before
+        // the next step that is not one of them, a host-side note or a
+        // buffer refresh (those neither write title memory nor read a
+        // staging buffer), and when the list's steps are through.
+        let mut textures: Vec<std::sync::Arc<crate::texture::Staging>> = Vec::new();
         for step in &self.deferred().copies {
+            if !textures.is_empty() && !matches!(step, Step::Texture(_) | Step::Host(_) | Step::Refresh(..)) {
+                crate::texture::refresh_all(&textures);
+                textures.clear();
+            }
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -5878,7 +5888,11 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if crate::texture::batched() {
+                            textures.push(staging.clone());
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
@@ -5886,6 +5900,7 @@ impl HostList {
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+        crate::texture::refresh_all(&textures);
     }
 }
 
@@ -6430,6 +6445,15 @@ impl Meter {
             }
         }
         {
+            let b = [0, 1, 2].map(|i| crate::texture::BATCHES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if b[0] > 0.0 {
+                tracing::info!(
+                    "textures read in place together per frame (VICTORY_TEXTURE_BATCH=1): {:.1} batches of {:.1} textures on {:.1} threads each",
+                    b[0],
+                    b[1] / b[0],
+                    b[2] / b[0]
+                );
+            }
             let [own, asking, still, all] =
                 [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
             if all >= 1.0 {
