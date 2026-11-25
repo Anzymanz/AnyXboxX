@@ -33,6 +33,11 @@
   Optional. Sets VICTORY_CARD_REHASH_RUNS=1 so VIctory hashes adjacent or overlapping GPU memory ranges in batches
   after uploading them. Without this switch the launcher leaves the environment variable as inherited.
 
+
+.PARAMETER Fast
+  Optional. Sets the options measured together as the faster set (the `$fastSet` table below) on top of the tuned
+  settings. It does NOT set VICTORY_RELAY (fork issue #89). Not the default until game runs confirm it: measure with
+  and without.
 .NOTES
   The first cold launch may crash while the pipelines compile; launch again once the cache is filled.
   Settings measured on 2026-11-24 with the VIctory commit then pinned (fxceless/victory-gta6).
@@ -52,7 +57,8 @@ param(
     [switch]$Precompile,
     [string]$XgDll,
     [ValidateSet('real', 'compare')][string]$XgMode = 'real',
-    [switch]$BatchCardRehash
+    [switch]$BatchCardRehash,
+    [switch]$Fast
 )
 
 $ErrorActionPreference = 'Stop'
@@ -114,6 +120,24 @@ if ($Dred) {
 }
 if ($BatchCardRehash) {
     $env:VICTORY_CARD_REHASH_RUNS = '1'
+}
+# The faster set, measured together. Not VICTORY_RELAY (fork issue #89). Off by default; -Fast turns it on. The
+# launcher test checks that each variable is read by VIctory.
+if ($Fast) {
+    $fastSet = [ordered]@{
+        VICTORY_CARD_REHASH_RUNS  = '1'
+        VICTORY_INDIRECT_WINDOW   = '1'
+        VICTORY_JOIN_COPIES       = '1'
+        VICTORY_TEXTURE_BATCH     = '1'
+        VICTORY_INDIRECT_GATHER   = '1'
+        # Staging memory cut from 64 MiB blocks (no committed buffer per texture; freed ranges wait for their flights).
+        VICTORY_STAGING_BLOCKS    = '1'
+        # Dirty-slot heap pass: only the slots marked since the last pass are looked at (full sweep every 256 passes).
+        VICTORY_HEAP_PASS_DIRTY   = '1'
+    }
+    foreach ($name in $fastSet.Keys) {
+        Set-Item -Path "Env:$name" -Value $fastSet[$name]
+    }
 }
 if ($PSBoundParameters.ContainsKey('SkipPipelines') -and $SkipPipelines) {
     $env:VICTORY_SKIP_PIPELINES = $SkipPipelines

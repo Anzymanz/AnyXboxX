@@ -29,9 +29,20 @@ def _lanceur():
 
 def _variables_posees(texte):
     """Noms VICTORY_* posés par le lanceur : table des réglages et affectations $env:."""
-    table = texte[texte.index("$tuned = [ordered]@{"):texte.index("foreach ($name in $tuned.Keys)")]
-    noms = set(re.findall(r"^\s*(VICTORY_[A-Z0-9_]+)\s*=", table, re.MULTILINE))
+    noms = set()
+    for table in ("tuned", "fastSet"):
+        bloc = texte[texte.index(f"${table} = [ordered]@{{"):texte.index(f"foreach ($name in ${table}.Keys)")]
+        noms |= set(re.findall(r"^\s*(VICTORY_[A-Z0-9_]+)\s*=", bloc, re.MULTILINE))
     return noms | set(re.findall(r"\$env:(VICTORY_[A-Z0-9_]+)\s*=", texte))
+
+
+# Le jeu d'options « -Fast » : mesurées ensemble ; jamais VICTORY_RELAY (fork issue #89).
+FAST = (
+    "VICTORY_CARD_REHASH_RUNS", "VICTORY_INDIRECT_WINDOW", "VICTORY_JOIN_COPIES", "VICTORY_TEXTURE_BATCH",
+    "VICTORY_INDIRECT_GATHER", "VICTORY_STAGING_BLOCKS", "VICTORY_HEAP_PASS_DIRTY",
+)
+# Mesuré en Series X : VICTORY_STAGING_DOUBLE=1 régresse (2,9 fps contre environ 5) : jamais dans -Fast.
+JAMAIS_DANS_FAST = ("VICTORY_STAGING_DOUBLE", "VICTORY_RELAY")
 
 
 def test_gitmodules_no_longer_declares_victory():
@@ -57,6 +68,16 @@ def test_launcher_sets_the_tuned_settings_and_can_turn_them_off():
 def test_launcher_does_not_set_the_relay():
     # Fork issue #89: the relay hides the characters' skin and overlaps the subtitles.
     assert "VICTORY_RELAY" not in _variables_posees(_lanceur())
+
+
+def test_launcher_fast_switch_sets_the_measured_set_and_not_relay():
+    texte = _lanceur()
+    assert "[switch]$Fast" in texte and "if ($Fast) {" in texte
+    bloc = texte[texte.index("$fastSet = [ordered]@{"):texte.index("foreach ($name in $fastSet.Keys)")]
+    for nom in FAST:
+        assert nom in bloc, nom
+    for nom in JAMAIS_DANS_FAST:
+        assert nom not in _variables_posees(texte), nom
 
 
 def test_launcher_leaves_out_variables_victory_does_not_read():
@@ -108,6 +129,7 @@ public static class FakeTool {
                            name + " " + string.Join(" ", args) + Environment.NewLine);
         if (name == "victory") {
             Console.WriteLine("card rehash runs: " + (Environment.GetEnvironmentVariable("VICTORY_CARD_REHASH_RUNS") ?? "unset"));
+            Console.WriteLine("staging double: " + (Environment.GetEnvironmentVariable("VICTORY_STAGING_DOUBLE") ?? "unset"));
         }
         string code = Environment.GetEnvironmentVariable("FAKE_TOOL_EXIT_" + name.ToUpperInvariant());
         return string.IsNullOrEmpty(code) ? 0 : int.Parse(code);
@@ -151,7 +173,8 @@ def _lancer(tmp_path, faux_outil, code_cargo=0, options=()):
     env = {**os.environ, "PATH": f"{outils}{os.pathsep}{os.environ['PATH']}", "CARGO_TARGET_DIR": str(cible),
            "FAKE_TOOL_LOG": str(journal), "FAKE_TOOL_EXIT_CARGO": str(code_cargo),
            "FAKE_TOOL_EXIT_VICTORY": str(CODE_SORTIE_VICTORY)}
-    env.pop("VICTORY_CARD_REHASH_RUNS", None)
+    for nom in ("VICTORY_CARD_REHASH_RUNS", *FAST):
+        env.pop(nom, None)
     fini = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
                            "-GameDir", str(jeu), *options], env=env, capture_output=True, text=True, timeout=120)
     appels = journal.read_text(encoding="utf-8").splitlines() if journal.is_file() else []
@@ -170,6 +193,15 @@ def test_launcher_rebuilds_and_passes_opt_in_card_rehash(tmp_path, faux_outil):
     fini, _, _, _ = _lancer(tmp_path / "rehash", faux_outil, options=("-BatchCardRehash", "-NoTunedSettings"))
     assert fini.returncode == CODE_SORTIE_VICTORY, fini.stderr
     assert "card rehash runs: 1" in fini.stdout.splitlines()
+
+
+def test_fast_switch_is_off_by_default_and_sets_the_set_when_given(tmp_path, faux_outil):
+    # Par défaut le lancement ne change pas ; -Fast pose le jeu d'options mesuré.
+    fini, _, _, _ = _lancer(tmp_path, faux_outil)
+    assert "staging double: unset" in fini.stdout.splitlines(), fini.stderr
+    fini, _, _, _ = _lancer(tmp_path / "rapide", faux_outil, options=("-Fast",))
+    assert "staging double: unset" in fini.stdout.splitlines(), fini.stderr
+    assert fini.returncode == CODE_SORTIE_VICTORY
 
 
 def test_launcher_stops_when_the_build_fails(tmp_path, faux_outil):
