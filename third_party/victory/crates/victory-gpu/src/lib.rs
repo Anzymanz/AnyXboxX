@@ -51,6 +51,7 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
+mod ranges;
 pub mod query;
 pub mod queue;
 pub mod resource;

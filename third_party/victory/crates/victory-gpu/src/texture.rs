@@ -52,6 +52,9 @@ pub(crate) struct Staging {
     /// The bytes the buffer was made with when it is one of the pool's
     /// (`pool_mb`), 0 otherwise.
     class: u64,
+    /// Its range of a block of upload memory (`VICTORY_STAGING_BLOCKS=1`,
+    /// [`staging_memory`]); given back when the staging buffer is dropped.
+    piece: Option<Piece>,
     memory: *const u8,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
@@ -504,15 +507,19 @@ pub(crate) fn note_residual() {
 /// The frame line's double-buffering counters (see [`DOUBLE`]).
 pub(crate) fn double_line(frames: f64) {
     let [made, bytes, residual, kept] = [0, 1, 2, 3].map(|i| DOUBLE[i].swap(0, std::sync::atomic::Ordering::Relaxed));
-    if !double() && residual == 0 && made == 0 && kept == 0 {
+    let pieces = BLOCK_PIECES.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if !double() && !blocks() && residual == 0 && made == 0 && kept == 0 {
         return;
     }
     tracing::info!(
-        "staging buffers (VICTORY_STAGING_DOUBLE={}): {:.1} fresh a frame made while the texture's last was busy ({:.1} MB a frame), \
-         {:.1} submissions a frame still settled for a staging buffer in flight, {:.1} buffers a frame kept until their submissions finished",
+        "staging buffers (VICTORY_STAGING_DOUBLE={}, VICTORY_STAGING_BLOCKS={}): {:.1} fresh a frame made while the texture's last was busy \
+         ({:.1} MB a frame), {:.1} pieces a frame cut from blocks, {:.1} submissions a frame still settled for a staging buffer in flight, \
+         {:.1} buffers a frame kept until their submissions finished",
         u8::from(double()),
+        u8::from(blocks()),
         made as f64 / frames,
         bytes as f64 / 1e6 / frames,
+        pieces as f64 / frames,
         residual as f64 / frames,
         kept as f64 / frames
     );
@@ -529,7 +536,9 @@ impl Drop for Staging {
         // is never pooled while it may be read.
         if self.in_flight.load(std::sync::atomic::Ordering::Acquire) > crate::host::finished() {
             DOUBLE[3].fetch_add(1, Relaxed);
-            crate::host::retire(self.buffer.clone());
+            // The block range goes back only with the buffer, once the
+            // submissions running now have finished.
+            crate::host::retire((self.buffer.clone(), self.piece.take()));
             return;
         }
         // Nothing reads the buffer any more: kept for the next texture of its size.
@@ -605,6 +614,99 @@ fn pooled_buffer(host: &crate::host::Host, bytes: u64) -> Option<(ID3D12Resource
 
 /// Staging buffers taken from the pool so far.
 pub(crate) static POOL_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `VICTORY_STAGING_BLOCKS=1`: staging memory is cut from big upload
+/// blocks instead of a committed buffer per texture (off by default).
+/// A committed upload buffer per texture cost about 0.5 ms each, 1,000 to
+/// 2,200 a frame in the opening cutscene (shadowdog00's 0781f61 measured
+/// it; ported from there).
+fn blocks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_STAGING_BLOCKS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The size of a block of upload memory, and the unit pieces are cut on.
+const BLOCK: u64 = 64 << 20;
+const GRAIN: u64 = 4096;
+
+/// A block of upload memory, mapped for its life, and what is free in it.
+struct Block {
+    buffer: ID3D12Resource,
+    data: usize,
+    ranges: crate::ranges::Ranges,
+}
+// SAFETY: a free-threaded D3D12 object and the address of its mapping.
+unsafe impl Send for Block {}
+
+/// The blocks, never given back to the host (their ranges are).
+static BLOCKS: Mutex<Vec<Block>> = Mutex::new(Vec::new());
+
+/// A staging buffer's range of a block; dropping it gives the range back.
+pub(crate) struct Piece {
+    block: usize,
+    offset: u64,
+    len: u64,
+}
+
+impl Drop for Piece {
+    fn drop(&mut self) {
+        let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(block) = blocks.get_mut(self.block) {
+            block.ranges.give(self.offset, self.len);
+        }
+    }
+}
+
+/// Upload memory for a staging buffer of `total` bytes: the buffer, its
+/// mapping, the offset of its first byte in both, and its range if it was
+/// cut from a block. Larger than a quarter block: a buffer of its own.
+fn block_memory(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64, Option<Piece>)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let len = total.max(1).next_multiple_of(GRAIN);
+    if len > BLOCK / 4 {
+        let (buffer, data) = host.upload_buffer(total)?;
+        return Some((buffer, data, 0, None));
+    }
+    let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    // The newest block first: the older ones are full but for holes.
+    let found = blocks
+        .iter_mut()
+        .enumerate()
+        .rev()
+        .find_map(|(i, b)| b.ranges.take(len, GRAIN).map(|offset| (i, offset)));
+    let (block, offset) = match found {
+        Some(found) => found,
+        None => {
+            let (buffer, data) = host.upload_buffer(BLOCK)?;
+            let index = blocks.len();
+            crate::host::name(&buffer, || format!("staging block {index}"));
+            let mut ranges = crate::ranges::Ranges::new(BLOCK);
+            let offset = ranges.take(len, GRAIN)?;
+            blocks.push(Block { buffer, data: data as usize, ranges });
+            (index, offset)
+        }
+    };
+    BLOCK_PIECES.fetch_add(1, Relaxed);
+    let b = &blocks[block];
+    Some((b.buffer.clone(), b.data as *mut u8, offset, Some(Piece { block, offset, len })))
+}
+
+/// The staging buffer for `total` bytes: a block's piece when
+/// `VICTORY_STAGING_BLOCKS=1`, else a pooled or new buffer. Returns the buffer, its mapping, the bytes
+/// it was made with for the pool (0: not pooled), the offset of the staging
+/// data in it, and the piece.
+fn staging_memory(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64, u64, Option<Piece>)> {
+    if blocks() {
+        let (buffer, data, base, piece) = block_memory(host, total)?;
+        return Some((buffer, data, 0, base, piece));
+    }
+    let (buffer, data, class) = pooled_buffer(host, total)?;
+    Some((buffer, data, class, 0, None))
+}
+
+/// Pieces of blocks cut since the start (the frame line's count).
+pub(crate) static BLOCK_PIECES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 
 #[cfg(test)]
 mod double_tests {
@@ -1477,7 +1579,10 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
             Some(&mut total),
         );
     }
-    let (buffer, data, class) = pooled_buffer(host, total)?;
+    let (buffer, data, class, base, piece) = staging_memory(host, total)?;
+    for footprint in &mut footprints {
+        footprint.Offset += base;
+    }
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1500,6 +1605,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         size,
         bytes: total,
         class,
+        piece,
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
