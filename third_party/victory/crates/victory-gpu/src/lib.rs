@@ -73,7 +73,7 @@ mod watch;
 mod upscale;
 
 #[cfg(windows)]
-pub use host::{adapter as host_adapter, on_failure};
+pub use host::on_failure;
 #[cfg(windows)]
 pub use upscale::hook as upscaler_dispatch;
 #[cfg(windows)]

@@ -787,7 +787,7 @@ pub(crate) fn upscale(this: This, colour: This, output: This, render: [u32; 2], 
     if [this as usize, colour as usize, output as usize].iter().any(|&p| p < 0x1_0000 || p % 8 != 0) {
         return false;
     }
-    let Some(list) = recording_list(this) else {
+    let Some(list) = host_list(this) else {
         return false;
     };
     let (Some(to), Some(from)) = (
