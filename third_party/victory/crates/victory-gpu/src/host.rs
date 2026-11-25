@@ -81,6 +81,11 @@ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The number of the latest late submission that has finished (waited for).
+pub(crate) fn finished() -> u64 {
+    FINISHED.load(Ordering::Acquire)
+}
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
@@ -4609,6 +4614,7 @@ impl Host {
             }
         }
         if late && staging_in_flight(runs) {
+            crate::texture::note_residual();
             if relay_exact() {
                 relay_wait(WHY_READ, |_| !staging_in_flight(runs));
             } else {
@@ -6594,6 +6600,7 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
         late_line(frames);
+        crate::texture::double_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         {

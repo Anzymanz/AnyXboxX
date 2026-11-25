@@ -474,13 +474,65 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
 /// bytes.
 static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// `VICTORY_STAGING_DOUBLE=1`: a texture whose staging buffer is still
+/// held by a list or read by a submission in flight gets a fresh buffer
+/// for the list recording it, instead of the submission waiting for the
+/// card (off by default).
+pub(crate) fn double() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_STAGING_DOUBLE").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Counters for the frame line: [fresh buffers made while the texture's
+/// last one was busy, their bytes, submissions that still settled for a
+/// staging buffer in flight, buffers kept until their submissions
+/// finished]. Taken with [`double_line`].
+pub(crate) static DOUBLE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Whether a staging buffer can be recorded into and refreshed as it is:
+/// no list holds it besides the map (`holders` counts the map's reference
+/// too), and no submission that may read it is still running.
+pub(crate) fn reusable(holders: usize, in_flight: u64, finished: u64) -> bool {
+    holders <= 1 && in_flight <= finished
+}
+
+/// Notes a submission that settled for a staging buffer still in flight.
+pub(crate) fn note_residual() {
+    DOUBLE[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The frame line's double-buffering counters (see [`DOUBLE`]).
+pub(crate) fn double_line(frames: f64) {
+    let [made, bytes, residual, kept] = [0, 1, 2, 3].map(|i| DOUBLE[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    if !double() && residual == 0 && made == 0 && kept == 0 {
+        return;
+    }
+    tracing::info!(
+        "staging buffers (VICTORY_STAGING_DOUBLE={}): {:.1} fresh a frame made while the texture's last was busy ({:.1} MB a frame), \
+         {:.1} submissions a frame still settled for a staging buffer in flight, {:.1} buffers a frame kept until their submissions finished",
+        u8::from(double()),
+        made as f64 / frames,
+        bytes as f64 / 1e6 / frames,
+        residual as f64 / frames,
+        kept as f64 / frames
+    );
+}
+
 impl Drop for Staging {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
-        // Nothing reads the buffer any more (a list that copied from it
-        // held this until its reset): kept for the next texture of its size.
+        // A submission may still read the buffer on the GPU (a list that
+        // copied from it can be reset before its submission finishes): it
+        // stays alive until the submissions running now have finished, and
+        // is never pooled while it may be read.
+        if self.in_flight.load(std::sync::atomic::Ordering::Acquire) > crate::host::finished() {
+            DOUBLE[3].fetch_add(1, Relaxed);
+            crate::host::retire(self.buffer.clone());
+            return;
+        }
+        // Nothing reads the buffer any more: kept for the next texture of its size.
         if self.class != 0 {
             let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
             if POOLED.load(Relaxed) + self.class <= pool_mb() << 20 {
@@ -553,6 +605,24 @@ fn pooled_buffer(host: &crate::host::Host, bytes: u64) -> Option<(ID3D12Resource
 
 /// Staging buffers taken from the pool so far.
 pub(crate) static POOL_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+mod double_tests {
+    use super::reusable;
+
+    #[test]
+    fn a_staging_buffer_is_reused_only_when_nothing_holds_or_reads_it() {
+        // Only the map holds it, and nothing in flight reads it.
+        assert!(reusable(1, 0, 0));
+        assert!(reusable(1, 5, 5));
+        // A list still records or holds it.
+        assert!(!reusable(2, 0, 0));
+        // A submission that may still read it has not finished.
+        assert!(!reusable(1, 7, 6));
+        // Finished submissions do not block reuse.
+        assert!(reusable(1, 3, 9));
+    }
+}
 
 #[cfg(test)]
 mod pool_tests {
@@ -1350,10 +1420,18 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
+    // With `VICTORY_STAGING_DOUBLE=1` a buffer a list or a flight still
+    // holds is not recorded into again: a fresh one takes its place in the
+    // map (the old one lives on with its holders, and is kept alive while
+    // its submission may read it).
+    let mut busy = false;
     if let Some(s) = map.get(&(resource as usize))
         && s.first <= first
     {
-        return Some(s.clone());
+        if !double() || reusable(Arc::strong_count(s), s.in_flight(), crate::host::finished()) {
+            return Some(s.clone());
+        }
+        busy = true;
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
@@ -1429,6 +1507,10 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         in_flight: std::sync::atomic::AtomicU64::new(0),
     });
+    if busy {
+        DOUBLE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        DOUBLE[1].fetch_add(s.bytes, std::sync::atomic::Ordering::Relaxed);
+    }
     map.insert(resource as usize, s.clone());
     Some(s)
 }
