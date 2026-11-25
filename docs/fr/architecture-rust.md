@@ -254,6 +254,20 @@ Finie quand : `git ls-files '*.py' '*.cpp' '*.h' '*.ps1'` ne liste rien hors de 
 
 ## Risques et décisions pour le mainteneur
 
+**Décisions prises le 25/11/2026** (par le lead, pour le mainteneur, après la relecture de #211) :
+
+- **D2 : le mode isolé Unicorn est abandonné** dans l'état final. Python + Unicorn ne restent que
+  comme oracle de parité temporaire et partent avec Python en phase 6 ; aucun bac à sable Rust
+  n'est écrit.
+- **D3 : la logique GDK d'AnyXboxX va dans les modules de `victory-hle`.** Pas de crate
+  `anyxboxx-gdk` séparée, sauf si une cdylib a besoin de code partagé avec VIctory ; seul ce code
+  passe alors dans une petite crate.
+- **D4 : un seul lanceur.** `apps/victory`, piloté par `anyxboxx run` (qui remplace
+  `tools/lancer_victory.ps1`) ; `anyxboxx.exe` est supprimé en phase 3.
+- **Chaîne d'outils : la racine épingle Rust 1.98.1**, comme VIctory (`rust-toolchain.toml`).
+
+Les paragraphes ci-dessous gardent les options telles qu'elles ont été pesées.
+
 - **D1. Les DLL C++ deviennent des cdylib Rust.** Rust peut exporter les mêmes symboles non
   décorés (`#[unsafe(no_mangle)] extern "system"`) et des vtables de type COM, comme le font déjà
   les crates `compat/*` de TomBox. Vrais obstacles à vérifier pour chaque DLL : exports par ordinal
@@ -282,7 +296,8 @@ Finie quand : `git ls-files '*.py' '*.cpp' '*.h' '*.ps1'` ne liste rien hors de 
   et vérifier que les compilations de `rust/` et de TomBox en CI restent compatibles.
 - **Écarts de comportement du portage.** `anyxboxx-pe` refuse les types de relocation autres
   qu'ABSOLUTE, HIGHLOW et DIR64 (pefile appliquait aussi HIGH, LOW et HIGHADJ, inutilisés en
-  x86-64), et une section dont les données sont hors du fichier (pefile l'ignorait sans rien dire).
+  x86-64), un bloc de relocations malformé (pefile abandonnait la suite de la table avec un
+  avertissement) et une section dont les données sont hors du fichier (pefile l'ignorait sans rien dire).
   Les bornes des vérifications TLS utilisent `SizeOfImage`, là où le chargeur Python prenait la
   longueur de l'image placée par pefile. Seules des images malformées sont concernées ; le
   comportement plus strict suit la règle 3 (pas de faux succès).

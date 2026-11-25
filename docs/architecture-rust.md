@@ -239,6 +239,18 @@ Done when: `git ls-files '*.py' '*.cpp' '*.h' '*.ps1'` lists nothing outside `th
 
 ## Risks and decisions for the maintainer
 
+**Decisions taken on 2026-11-25** (by the lead, for the maintainer, after review of #211):
+
+- **D2: the isolated Unicorn mode is dropped** from the end state. Python + Unicorn stay only as a
+  temporary parity oracle and are deleted with Python in phase 6; no Rust sandbox is written.
+- **D3: AnyXboxX's GDK logic goes into `victory-hle` modules.** No separate `anyxboxx-gdk` crate,
+  unless a cdylib needs code shared with VIctory; then only that code moves to a small crate.
+- **D4: one launcher.** `apps/victory`, driven by `anyxboxx run` (which replaces
+  `tools/lancer_victory.ps1`); `anyxboxx.exe` is deleted in phase 3.
+- **Toolchain: the root pins Rust 1.98.1**, the same as VIctory (`rust-toolchain.toml`).
+
+The paragraphs below keep the options as they were weighed.
+
 - **D1. The C++ DLLs become Rust cdylibs.** Rust can export the same unmangled symbols
   (`#[unsafe(no_mangle)] extern "system"`) and COM-like vtables, as TomBox's `compat/*` crates
   already do. Real blockers to check per DLL: exports by ordinal only (need a `.def` file passed
@@ -263,7 +275,8 @@ Done when: `git ls-files '*.py' '*.cpp' '*.h' '*.ps1'` lists nothing outside `th
   `rust/` and TomBox builds still use a compatible version.
 - **Ported behaviour differences.** `anyxboxx-pe` refuses relocation types other than ABSOLUTE,
   HIGHLOW and DIR64 (pefile also applied HIGH, LOW and HIGHADJ, which x86-64 images do not use),
-  and a section whose raw data lies outside the file (pefile skipped it silently). Bounds of the
+  a malformed relocation block (pefile dropped the rest of the table with a warning), and a
+  section whose raw data lies outside the file (pefile skipped it silently). Bounds of the
   TLS checks use `SizeOfImage`, where the Python loader used the length of pefile's mapped image.
   These only concern malformed images; the stricter behaviour follows rule 3 (no fake success).
 
