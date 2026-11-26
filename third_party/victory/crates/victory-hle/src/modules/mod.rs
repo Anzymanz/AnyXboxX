@@ -21,6 +21,7 @@ pub mod files;
 pub mod gameinput;
 pub mod kernel;
 pub mod keymap;
+pub mod mouse;
 #[cfg(windows)]
 pub mod lifecycle;
 #[cfg(windows)]
