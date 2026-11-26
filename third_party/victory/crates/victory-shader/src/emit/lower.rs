@@ -265,9 +265,11 @@ struct Lower<'a> {
     /// With `local`: every mask read and lane read is taken per host wave
     /// ([`with_local_waves_any`]).
     local_any: bool,
-    /// With `exchange`: VGPR values every lane holds alike ([`lane_uniform`]); a first-lane
-    /// read of one needs nothing from the other host wave.
+    /// VGPR values every lane holds alike ([`lane_uniform`]); a first-lane read of one
+    /// needs nothing from the other host wave.
     uniform: HashSet<Value>,
+    /// A complete console wave can use the paired form for first-lane reads that need both halves.
+    pair_first_lane: bool,
     /// With `exchange`: the wave ORs that only steer a loop over each lane's own bits, which
     /// a host wave takes over its own lanes wherever they stand ([`super::own_bits`]).
     own_bits: super::own_bits::OwnBits,
@@ -1358,6 +1360,15 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let pair_first_lane = !paired
+            && exchange.is_none()
+            && x.native.wave64
+            && host_max_wave() == 32
+            && matches!(x.native.io, StageIo::Cs(cs) if cs.threads.iter().product::<u32>().is_multiple_of(64))
+            && insts().any(|i| {
+                i.name() == "v_readfirstlane_b32"
+                    && i.writes.first().is_some_and(|w| !x.res.waterfall.reads.contains(&w.1))
+            });
         Lower {
             s,
             x,
@@ -1422,8 +1433,12 @@ impl<'a> Lower<'a> {
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
                 Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all, super::nvidia::enabled()),
+                None if pair_first_lane => {
+                    all_lane_blocks(x.st).map_or_else(HashSet::new, |all| lane_uniform(p, x.st, &all, false))
+                }
                 _ => HashSet::new(),
             },
+            pair_first_lane,
             own_bits: match &exchange {
                 Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() => {
                     super::own_bits::find(p, x.st, std::env::var_os("VICTORY_WAVE_WHY").is_some())
@@ -7739,16 +7754,21 @@ impl<'a> Lower<'a> {
                 int(self, a)
             }
             "v_readfirstlane_b32" => {
-                let a = s(self, 0)?;
-                let (mine, any) = self.first_lane(a, guard);
-                // two host waves that exchange: the console's first lane may be in the other
-                // one, unless every lane holds the same value
+                // The console's first active lane can be in the other host half. A
+                // wave-uniform source already has the same value in both halves.
                 let alike = match v.src.first() {
                     Some(&Operand::Vector { reg, .. }) => {
                         inst.read(Reg::V(reg)).is_some_and(|x| self.uniform.contains(&x))
                     }
                     _ => true,
                 };
+                if self.pair_first_lane && !alike {
+                    // The normal form would read only this host half. Retry through
+                    // emit_any's paired form, which can read both halves of the wave.
+                    return Err("v_readfirstlane_b32 needs both halves of the console wave");
+                }
+                let a = s(self, 0)?;
+                let (mine, any) = self.first_lane(a, guard);
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
                 let r = if halves && !alike {
                     if !self.all_lanes(self.cur_ir) {

@@ -1018,6 +1018,84 @@ fn paired_lanes_permute_shift_and_write_lanes_of_both_halves() {
     eprintln!("ran on the hardware device: permutes, row masks, swizzles and lane writes as on the console");
 }
 
+#[test]
+fn readfirstlane_uses_the_whole_console_wave() {
+    use windows::Win32::Graphics::Direct3D12::{D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1};
+
+    let mut words = vec![
+        vop2(0x1B, 1, k(63), 0), // v1 = flat thread ID modulo 64
+        sop1(0x04, 12, EXEC),    // save EXEC
+        vopc(0xD3, 0, 1),       // v_cmpx_le_u32 s0, v1
+        vop1(0x02, 6, v(0)),    // v_readfirstlane_b32 s6, v0
+        sop1(0x04, EXEC, 12),    // restore EXEC for the store
+        vop1(0x01, 2, 6),       // v_mov_b32 v2, s6
+        vop2(0x1A, 15, k(2), 0), // v15 = byte offset of this thread's result
+    ];
+    words.extend(store(2, 15, 0));
+    let container = crate::dxbc::build(&[]);
+    let container = super::Container::parse(&container).expect("container");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let wave32 = Host::new(false).ok().is_some_and(|host| {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: D3D12 writes its OPTIONS1 structure into the matching buffer.
+        let queried = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+        queried.is_ok() && options.WaveOps.as_bool()
+            && options.WaveLaneCountMin <= 32 && options.WaveLaneCountMax >= 32
+    });
+    for threads in [64, 128] {
+        let native = native_of(&words, true, threads);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let old = lower::TEST_HOST_WAVE.replace(Some(32));
+        let pairs = super::TEST_PAIRS.replace(Some(true));
+        let shader = super::emit(&container, &native, &p, &st, &io, &res);
+        super::TEST_PAIRS.set(pairs);
+        lower::TEST_HOST_WAVE.set(old);
+        let shader = shader.expect("emit a first-lane read for a 32-lane host");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        }
+        if !wave32 {
+            continue;
+        }
+        for cutoff in [0, 10, 40, 63, 64] {
+            let got = run_paired(&shader, [cutoff, 0, 0, 0], threads).expect("dispatch on a 32-lane device");
+            assert_eq!(got.len(), threads as usize);
+            for (lane, value) in got.into_iter().enumerate() {
+                let first = (lane as u32 & !63) + if cutoff < 64 { cutoff } else { 0 };
+                assert_eq!(value, first, "{threads} threads, EXEC cutoff {cutoff}, lane {lane}");
+            }
+        }
+    }
+    if wave32 {
+        eprintln!("ran on the hardware device: the first active lane of each console wave for both group sizes");
+    } else {
+        eprintln!("no SM 6.6 device with 32-lane waves; dispatch skipped");
+    }
+}
+
+#[test]
+fn readfirstlane_with_a_uniform_source_lowers_without_pairing() {
+    let mut words = vec![
+        vop1(0x01, 1, 0),      // v_mov_b32 v1, s0: every lane gets the same value
+        vop1(0x02, 6, v(1)),   // v_readfirstlane_b32 s6, v1
+        vop1(0x01, 2, 6),      // v_mov_b32 v2, s6
+        vop2(0x1A, 15, k(2), 0),
+    ];
+    words.extend(store(2, 15, 0));
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    lowered(&native, &p, &HashSet::new()).expect("lower the wave-uniform first-lane read");
+}
+
 /// [`program`]'s wave OR inside a per-lane branch, in the paired form: the OR of both halves'
 /// lanes, whichever take the branch; nothing stored when none does.
 #[test]
