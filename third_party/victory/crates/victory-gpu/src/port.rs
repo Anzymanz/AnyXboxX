@@ -190,12 +190,6 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     if first > at || first + bytes < end || offset % K64 != 0 {
         return Err((3, format!("the stretch {first:#x}+{bytes:#x} does not hold it")));
     }
-    // Under Wine on AMD the opening below succeeds and the card reads other
-    // memory: the title's bytes never reach it, nor the card's writes the
-    // title (`crate::inplace::views_in_place`).
-    if !crate::inplace::views_in_place(device) {
-        return Err((5, "the host's heap on a view of a section is not that memory to the card".to_owned()));
-    }
     // SAFETY: the section of a view the title has; the runtime keeps its
     // handle open while a view of it is there, and the range is inside it.
     let view = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, bytes as usize) }.Value as usize;

@@ -106,8 +106,7 @@ impl ResourceDesc {
     }
 
     /// The texture of this one's levels from `base` on.
-    #[allow(clippy::wrong_self_convention)]
-    fn from_level(&self, base: u32) -> ResourceDesc {
+    fn levels_from(&self, base: u32) -> ResourceDesc {
         let mut d = *self;
         if base > 0 {
             d.width = (d.width >> base).max(1);
@@ -127,6 +126,9 @@ pub(crate) struct AllocationInfo {
 
 const _: () = assert!(size_of::<HeapProperties>() == 20);
 const _: () = assert!(size_of::<HeapDesc>() == 48);
+// placed_resource_words copies the two field spans on either side of the padding.
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, alignment) == 8);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, flags) == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
 
 const BUFFER: u32 = 1;
@@ -682,27 +684,6 @@ pub(crate) struct PlacedFootprint {
     row_pitch: u32,
 }
 
-/// The rows a texture-to-buffer copy wrote in the host and title footprints.
-#[cfg(windows)]
-pub(crate) struct ReadbackRows {
-    pub(crate) row_bytes: usize,
-    pub(crate) rows: usize,
-    pub(crate) depth: usize,
-    pub(crate) slice_rows: usize,
-    pub(crate) host_pitch: usize,
-    pub(crate) title_pitch: usize,
-    pub(crate) host_start: usize,
-    pub(crate) title_start: usize,
-}
-
-#[cfg(windows)]
-impl ReadbackRows {
-    pub(crate) fn title_span(&self) -> usize {
-        let last_row = (self.depth - 1) * self.slice_rows + self.rows - 1;
-        last_row * self.title_pitch + self.row_bytes
-    }
-}
-
 impl PlacedFootprint {
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
@@ -712,97 +693,24 @@ impl PlacedFootprint {
         Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
     }
 
-    /// The full footprint at offset zero with D3D12's row alignment, the
-    /// buffer sizes, and the part of each footprint written by the copy.
-    #[cfg(windows)]
-    pub(crate) fn host_readback(
-        &self,
-        at: [u32; 3],
-        size: [u32; 3],
-    ) -> Option<(Self, [u64; 2], ReadbackRows)> {
+    /// For a read back through a host buffer: this footprint at offset 0
+    /// with its rows pitched as the host wants them (multiples of 256
+    /// bytes), then the bytes that buffer needs, the bytes of a row, the
+    /// rows, and the title's own pitch.
+    pub(crate) fn host_rows(&self) -> Option<(PlacedFootprint, [u64; 4])> {
         let (element, block) = element(self.format)?;
-        let [x, y, z] = at.map(u64::from);
-        let [width, height, depth] = size.map(u64::from);
-        if size.contains(&0)
-            || x + width > u64::from(self.width)
-            || y + height > u64::from(self.height)
-            || z + depth > u64::from(self.depth)
-            || !x.is_multiple_of(block)
-            || !y.is_multiple_of(block)
-        {
-            return None;
-        }
-        let full_row_bytes = u64::from(self.width).div_ceil(block) * element;
-        let slice_rows = u64::from(self.height).div_ceil(block);
-        let full_rows = slice_rows.checked_mul(u64::from(self.depth))?;
-        let host_pitch = full_row_bytes.next_multiple_of(256);
-        let title_pitch = u64::from(self.row_pitch);
-        if title_pitch < full_row_bytes {
-            return None;
-        }
-        let host_bytes = host_pitch.checked_mul(full_rows)?;
-        let title_bytes = title_pitch.checked_mul(full_rows - 1)?.checked_add(full_row_bytes)?;
-        let first_row = z * slice_rows + y / block;
-        let column = x / block * element;
+        let lines = (u64::from(self.height).div_ceil(block) * u64::from(self.depth)).max(1);
+        let row = u64::from(self.width).div_ceil(block) * element;
+        let pitch = row.max(1).next_multiple_of(256);
         let host = PlacedFootprint {
             offset: 0,
-            row_pitch: u32::try_from(host_pitch).ok()?,
+            row_pitch: u32::try_from(pitch).ok()?,
             ..*self
         };
-        let rows = ReadbackRows {
-            row_bytes: usize::try_from(width.div_ceil(block) * element).ok()?,
-            rows: usize::try_from(height.div_ceil(block)).ok()?,
-            depth: usize::try_from(depth).ok()?,
-            slice_rows: usize::try_from(slice_rows).ok()?,
-            host_pitch: usize::try_from(host_pitch).ok()?,
-            title_pitch: usize::try_from(title_pitch).ok()?,
-            host_start: usize::try_from(first_row * host_pitch + column).ok()?,
-            title_start: usize::try_from(first_row * title_pitch + column).ok()?,
-        };
-        Some((host, [host_bytes, title_bytes], rows))
+        Some((host, [pitch * lines, row, lines, u64::from(self.row_pitch)]))
     }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
-
-#[cfg(windows)]
-impl PlacedFootprint {
-    /// Restricts a 2D upload to the box's rows (`region`, the title's source
-    /// box): the footprint of those rows at offset 0 with the same pitch, the
-    /// offset of the first of them in the title's footprint, and the bytes
-    /// to stage; the box's Y is rebased onto them. `None` (nothing changed)
-    /// for a box of every row, of part of a block row, or of more than one
-    /// slice.
-    pub(crate) fn crop_upload_rows(self, region: &mut [u32; 6], full_bytes: u64) -> Option<(Self, u64, u64)> {
-        let [left, top, front, right, bottom, back] = *region;
-        let (element, block) = element(self.format)?;
-        if (self.depth, front, back) != (1, 0, 1)
-            || left >= right
-            || right > self.width
-            || top >= bottom
-            || bottom > self.height
-            || (top == 0 && bottom == self.height)
-            || !u64::from(top).is_multiple_of(block)
-            || !u64::from(bottom).is_multiple_of(block)
-        {
-            return None;
-        }
-        let pitch = u64::from(self.row_pitch);
-        if pitch < u64::from(self.width).div_ceil(block) * element {
-            return None;
-        }
-        let height = bottom - top;
-        let start = pitch * (u64::from(top) / block);
-        let cropped = Self { offset: 0, height, ..self };
-        // The title's footprint may end at the last row's final texel.
-        let bytes = (pitch * (u64::from(height) / block)).min(full_bytes.checked_sub(start)?);
-        if bytes < cropped.bytes()? {
-            return None;
-        }
-        region[1] = 0;
-        region[4] = height;
-        Some((cropped, start, bytes))
-    }
-}
 
 const NO_FOOTPRINT: PlacedFootprint = PlacedFootprint {
     offset: u64::MAX,
@@ -1729,7 +1637,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let texture = match texture {
             Some(texture) => Some(texture),
-            None => host_texture(&r.desc.from_level(base), r.host.state, clear),
+            None => host_texture(&r.desc.levels_from(base), r.host.state, clear),
         };
         let Some(texture) = texture else {
             r.host.refused.store(true, Relaxed);
@@ -1840,7 +1748,9 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
+            used.saturating_sub(crate::pool::texture_room())
+                .saturating_add(crate::shadow::card_room_kept())
+                .saturating_add(targets_room_kept())
                 < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
@@ -2132,6 +2042,15 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
     }
 }
 
+#[cfg(any(windows, test))]
+fn sweep_batch(all: &std::collections::BTreeSet<usize>, from: usize, limit: usize) -> impl Iterator<Item = usize> + '_ {
+    // The last batch can end exactly at the final address, or the
+    // remaining textures can be released between passes.
+    let tail = all.range(from..);
+    let batch = if from != 0 && tail.clone().next().is_none() { all.range(..) } else { tail };
+    batch.take(limit).copied()
+}
+
 /// Lets go of the host copies of textures the title fills that nothing
 /// names any more: placed textures were never released (one host texture
 /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
@@ -2159,16 +2078,6 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    let lingered = let_go_lingering();
-    if !lingered.is_empty() {
-        crate::host::trail(|| {
-            format!(
-                "sweep: tiles of {} levels-on-demand textures given back ({} KiB) once no slot held them any more",
-                lingered.len(),
-                lingered.iter().map(|l| l.1).sum::<u64>() >> 10
-            )
-        });
-    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -2188,11 +2097,15 @@ pub(crate) fn let_go_idle() {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
+    // The card's room says nothing of the PC's: what the card spills to
+    // system memory is commit too. Short of it ([`crate::residency::pressured`]),
+    // idle copies go after seconds, not the minutes room on the card keeps them.
     let (idle_ms, most) = match memory {
+        _ if crate::residency::pressured() => (5_000, u64::MAX),
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
-                + crate::shadow::card_room_kept()
-                + targets_room_kept();
+                .saturating_add(crate::shadow::card_room_kept())
+                .saturating_add(targets_room_kept());
             crate::host::vram_keep(budget, used)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
@@ -2231,7 +2144,7 @@ pub(crate) fn let_go_idle() {
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
     let began = std::time::Instant::now();
-    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
+    for at in sweep_batch(&all, from, part).chain(by_age.iter().map(|&(_, at)| at)) {
         if bytes >= most {
             break;
         }
@@ -2495,71 +2408,7 @@ impl Drop for HostTexture {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
         }
-        // A levels-on-demand texture's memory is the pool's tiles, not the
-        // resource's: they go back only once nothing else holds the resource.
-        if let Some(tiled) = self.tiled.take()
-            && crate::host::references(&self.texture) > 1
-        {
-            LINGERING.lock().unwrap_or_else(|e| e.into_inner()).push(Lingering(self.texture.clone(), tiled));
-            LINGERED.fetch_add(1, Relaxed);
-        }
     }
-}
-
-/// A levels-on-demand host texture (`crate::tiles`) whose host copy was
-/// dropped while something else still held its resource, and its tiles.
-///
-/// The memory of such a texture is tiles of the pool's heaps, given back
-/// when its [`crate::tiles::Tiled`] drops, and a heap whose tiles are all
-/// back is released at once. The resource itself outlives the host copy
-/// wherever a descriptor slot still shows it (`HostHeap::kept`, retired
-/// with the slot's next view): a slot the title wrote with a view of
-/// another texture keeps showing the old one until the new one is made
-/// (`VICTORY_KEEP_OTHER_VIEWS`, `same_placed_texture`), and the title may
-/// release the old texture meanwhile (a texture streamed in again at its
-/// address). Its tiles went back with the host copy, and draws that read
-/// the slot read tiles given to another texture, or a released heap: the
-/// card's page fault on texture reads (`Faulty UTCL2 client ID: TCP`) at
-/// an address inside one 64 KiB tile of the resource.
-///
-/// The tiles wait here, with a reference of ours, until ours is the only
-/// one; [`let_go_lingering`] looks at each sweep, which runs with nothing
-/// of ours on the card.
-#[cfg(windows)]
-struct Lingering(windows::Win32::Graphics::Direct3D12::ID3D12Resource, crate::tiles::Tiled);
-
-// SAFETY: a D3D12 resource (free-threaded) and its tile bookkeeping, as a
-// host texture holds them across threads.
-#[cfg(windows)]
-unsafe impl Send for Lingering {}
-
-#[cfg(windows)]
-static LINGERING: std::sync::Mutex<Vec<Lingering>> = std::sync::Mutex::new(Vec::new());
-
-/// Host copies whose tiles were kept for a resource still held, since the start.
-#[cfg(windows)]
-static LINGERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Gives back the tiles of [`Lingering`] textures that nothing else holds
-/// any more: (the resource's raw pointer, the bytes of its tiles) for each.
-/// Called with nothing of ours on the card (the sweep), so a reference let
-/// go by a retired slot is one no submission reads through.
-#[cfg(windows)]
-pub(crate) fn let_go_lingering() -> Vec<(usize, u64)> {
-    let gone: Vec<Lingering> = {
-        let mut lingering = LINGERING.lock().unwrap_or_else(|e| e.into_inner());
-        if lingering.is_empty() {
-            return Vec::new();
-        }
-        let (gone, kept): (Vec<Lingering>, Vec<Lingering>) =
-            std::mem::take(&mut *lingering).into_iter().partition(|l| crate::host::references(&l.0) == 1);
-        *lingering = kept;
-        gone
-    };
-    // Dropped outside the lock: the tiles go back to the pool under its own.
-    gone.into_iter()
-        .map(|l| (windows::core::Interface::as_raw(&l.0) as usize, l.1.given_bytes()))
-        .collect()
 }
 
 /// How many textures placed in title memory have a resource of ours
@@ -3164,9 +3013,13 @@ static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 
 
 /// The placed textures asked for with filler words set, as asked
 /// (address and description): for [`PLACED_TWINS`].
-#[cfg(windows)]
+#[cfg(all(windows, any(test, feature = "diagnostics")))]
 static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Most variants [`PLACED_RAW`] keeps; past it the set starts over.
+#[cfg(all(windows, feature = "diagnostics"))]
+const PLACED_RAW_CAP: usize = 1 << 14;
 
 /// Placed textures asked for a second time with other filler words in
 /// their description: each was a second resource and host copy before the
@@ -3257,6 +3110,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // that fills at world entry. They are not part of what a texture is.
     // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(feature = "diagnostics")]
     let raw = *desc;
     let mut key = *desc;
     if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
@@ -3267,8 +3121,15 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
     // the log: `placed_filler_twins`).
+    // Only a diagnostics build reads the count, so only it keeps the variants,
+    // and not past a cap: every filler variant the title ever passed was a
+    // set entry (about 100 bytes each, 1M of them in a synthetic load test).
+    #[cfg(feature = "diagnostics")]
     if raw != key {
         let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() >= PLACED_RAW_CAP {
+            seen.clear();
+        }
         if seen.insert((address, raw)) {
             let others = seen.range((address, [0; 14])..=(address, [u32::MAX; 14])).filter(|(_, r)| {
                 let mut blank = *r;
@@ -4757,6 +4618,71 @@ float4 lit() : SV_Target { return 1.0; }
     }
 
     #[test]
+    fn idle_sweep_restarts_after_a_full_last_batch() {
+        let all = std::collections::BTreeSet::from([1, 3, 5, 7]);
+        assert_eq!(sweep_batch(&all, 0, 2).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(sweep_batch(&all, 4, 2).collect::<Vec<_>>(), [5, 7]);
+        assert_eq!(sweep_batch(&all, 8, 2).collect::<Vec<_>>(), [1, 3]);
+    }
+
+    #[test]
+    fn idle_sweep_restarts_if_the_remaining_textures_were_released() {
+        let mut all = std::collections::BTreeSet::from([1, 3, 5]);
+        assert_eq!(sweep_batch(&all, 0, 2).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(sweep_batch(&all, 4, 2).collect::<Vec<_>>(), [5]);
+        all.remove(&5);
+        assert_eq!(sweep_batch(&all, 4, 2).collect::<Vec<_>>(), [1, 3]);
+    }
+
+    /// Load test (`cargo test -p victory-gpu --lib --locked placed_filler_bookkeeping_load -- --ignored --nocapture`).
+    /// `texture_at` is asked a million times for placed memory whose resource
+    /// description differs only in the filler words 1 and 13. A buffer
+    /// description is used so that no host resource is needed: `texture_at`
+    /// notes the filler variants before it looks at the dimension.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "load test: about a million lookups"]
+    fn placed_filler_bookkeeping_load() {
+        use crate::loadprobe::{mix, private_bytes};
+        const N: u64 = 1_000_000;
+        let raw_len = || PLACED_RAW.lock().unwrap().len();
+        let map_len = || PLACED_TEXTURES.lock().unwrap().len();
+        let (r0, m0, p0) = (raw_len(), map_len(), private_bytes());
+        // Control: no filler, a million addresses.
+        for n in 0..N {
+            let desc = [BUFFER, 0, 0, 0, 0x1000, 0, 1, 0x10001, 0, 1, 0, 0, 0, 0];
+            texture_at(0x10_0000_0000 + n * 0x1000, &desc);
+        }
+        let control = (raw_len() - r0, map_len() - m0, private_bytes().saturating_sub(p0));
+        eprintln!("no filler, {N} addresses: PLACED_RAW +{}, PLACED_TEXTURES +{}, private +{} KiB", control.0, control.1, control.2 >> 10);
+        // Filler varies, one entry per address as when many resources are placed.
+        let (r1, p1) = (raw_len(), private_bytes());
+        let t = std::time::Instant::now();
+        for n in 0..N {
+            let desc = [BUFFER, mix(n), 0, 0, 0x1000, 0, 1, 0x10001, 0, 1, 0, 0, 0, mix(n + N)];
+            texture_at(0x20_0000_0000 + (n % 100_000) * 0x1000, &desc);
+        }
+        let filler = (raw_len() - r1, private_bytes().saturating_sub(p1));
+        eprintln!(
+            "filler varies, {N} asks at 100,000 addresses: PLACED_RAW +{}, private +{} KiB, {:?}",
+            filler.0,
+            filler.1 >> 10,
+            t.elapsed()
+        );
+        // One address, ever more filler variants: the cost of one ask.
+        for k in [2_000u64, 4_000, 8_000] {
+            let t = std::time::Instant::now();
+            for n in 0..k {
+                let desc = [BUFFER, mix(n + 9 * N), 0, 0, 0x1000, 0, 1, 0x10001, 0, 1, 0, 0, 0, mix(n + 10 * N)];
+                texture_at(0x30_0000_0000 + k * 0x10_0000, &desc);
+            }
+            eprintln!("one address, {k} variants: {:?}", t.elapsed());
+        }
+        assert_eq!(control.0, 0, "no filler, nothing noted");
+        assert!(filler.0 <= 1 << 16, "{} filler variants kept for a log counter", filler.0);
+    }
+
+    #[test]
     fn texture_floor_scales_with_vram_budget() {
         const GIB: u64 = 1 << 30;
         assert_eq!(texture_floor_bytes(None), 2 * GIB);
@@ -4799,207 +4725,5 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
-    }
-
-    /// A levels-on-demand host copy dropped while a descriptor slot still
-    /// holds its resource keeps its tiles until that reference goes too:
-    /// the slot's view reads them meanwhile.
-    #[cfg(windows)]
-    #[test]
-    fn tiles_stay_while_a_slot_holds_the_dropped_copys_texture() {
-        use windows::Win32::Graphics::Direct3D12::*;
-        use windows::core::Interface;
-        let Some(host) = crate::host::host() else {
-            return;
-        };
-        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
-        // SAFETY: plain feature query on the host device.
-        let tier_ok = unsafe {
-            host.device
-                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, (&raw mut options).cast(), size_of_val(&options) as u32)
-                .is_ok()
-                && options.TiledResourcesTier.0 >= 2
-        };
-        if !tier_ok {
-            eprintln!("skipped: adapter tiled resources tier < 2");
-            return;
-        }
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-            Width: 1024,
-            Height: 1024,
-            DepthOrArraySize: 1,
-            MipLevels: 11,
-            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
-            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
-            ..Default::default()
-        };
-        let mut made: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation of a texture without memory of its own.
-        unsafe { host.device.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut made) }
-            .expect("reserved tiled texture on tier-2 device");
-        let tex = made.expect("reserved tiled texture");
-        let tiled = crate::tiles::Tiled::make(&host.device, &tex, 11).expect("card reports tiling for 1024x1024x11");
-        let (_, waiting) = tiled.uploaded_on(host.queue(), &host.device, &tex, (1u32 << 11) - 1, true);
-        assert!(!waiting, "tiles should map when room is true");
-        let bytes = tiled.given_bytes();
-        assert!(bytes > 0);
-        // What a descriptor slot keeps of the texture it shows.
-        let slot = tex.clone();
-        let raw = slot.as_raw() as usize;
-        drop(HostTexture::new_tiled(tex, 0, tiled));
-        assert!(
-            !super::let_go_lingering().iter().any(|l| l.0 == raw),
-            "tiles given back while a slot still showed the texture"
-        );
-        drop(slot);
-        let gone = super::let_go_lingering();
-        assert_eq!(gone.iter().find(|l| l.0 == raw).map(|l| l.1), Some(bytes), "the tiles were not kept, or not given back");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn readback_layout_counts_block_rows_and_volume_slices() {
-        let bc = PlacedFootprint {
-            offset: 512, format: 71, width: 16, height: 16, depth: 1, row_pitch: 64,
-        };
-        let (host, sizes, rows) = bc.host_readback([4, 4, 0], [8, 8, 1]).unwrap();
-        assert_eq!((host.offset, host.row_pitch), (0, 256));
-        assert_eq!(sizes, [1024, 224]);
-        assert_eq!((rows.row_bytes, rows.rows), (16, 2));
-        assert_eq!((rows.host_start, rows.title_start, rows.title_span()), (264, 72, 80));
-        assert!(bc.host_readback([1, 4, 0], [8, 8, 1]).is_none());
-        assert!(bc.host_readback([12, 4, 0], [8, 8, 1]).is_none());
-
-        let volume = PlacedFootprint {
-            offset: 0, format: 28, width: 4, height: 4, depth: 3, row_pitch: 64,
-        };
-        let (_, _, rows) = volume.host_readback([1, 1, 1], [2, 2, 2]).unwrap();
-        assert_eq!((rows.row_bytes, rows.rows, rows.depth, rows.slice_rows), (8, 2, 2, 4));
-        assert_eq!((rows.host_start, rows.title_start, rows.title_span()), (1284, 324, 328));
-        assert!(volume.host_readback([0, 0, 2], [2, 2, 2]).is_none());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn a_partial_texture_readback_preserves_unwritten_bytes() {
-        let Some(host) = crate::host::host() else {
-            return;
-        };
-
-        const IMAGE_WIDTH: usize = 4;
-        const PIXEL_BYTES: usize = 4;
-        const UPLOAD_PITCH: usize = 256;
-        const OUTPUT_PITCH: usize = 64;
-        const ZERO_ORIGIN: usize = 512;
-        const OFFSET_ORIGIN: usize = 1024;
-        const WHOLE_SOURCE: usize = 1536;
-        const BUFFER_BYTES: usize = 4096;
-        const SENTINEL: u8 = 0xcd;
-        let null = std::ptr::null();
-        let make = |desc: &ResourceDesc, state| {
-            let mut resource = null;
-            assert_eq!(
-                create_committed(null, &PROPERTIES, 0, desc, state, null.cast(), &RESOURCE_IIDS[0], &mut resource),
-                S_OK
-            );
-            resource
-        };
-        let image = make(&texture(IMAGE_WIDTH as u64, 4, 28, 1), 0x400);
-        let source = make(&buffer(BUFFER_BYTES as u64), 0);
-        let output = make(&buffer(BUFFER_BYTES as u64), 0);
-        let input = buffer_bytes(source).unwrap().0;
-        let result = buffer_bytes(output).unwrap().0;
-        let mut pattern = [0u8; UPLOAD_PITCH * 4];
-        for row in 0..4 {
-            for col in 0..IMAGE_WIDTH * PIXEL_BYTES {
-                pattern[row * UPLOAD_PITCH + col] = (row * 32 + col) as u8;
-            }
-        }
-        // SAFETY: both title buffers are live and hold BUFFER_BYTES bytes.
-        unsafe {
-            std::ptr::copy_nonoverlapping(pattern.as_ptr(), input, pattern.len());
-            result.write_bytes(SENTINEL, BUFFER_BYTES);
-        }
-
-        let allocator_iid = guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
-        let list_iid = guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
-        let (mut allocator, mut list) = (null, null);
-        assert_eq!(crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator), S_OK);
-        assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list), S_OK);
-
-        #[repr(C)]
-        struct Location {
-            resource: This,
-            kind: u32,
-            footprint: PlacedFootprint,
-        }
-        let upload = PlacedFootprint {
-            offset: 0, format: 28, width: IMAGE_WIDTH as u32, height: 4, depth: 1, row_pitch: UPLOAD_PITCH as u32,
-        };
-        let destination = |offset: usize, width, height| Location {
-            resource: output,
-            kind: 1,
-            footprint: PlacedFootprint { offset: offset as u64, width, height, row_pitch: OUTPUT_PITCH as u32, ..upload },
-        };
-        let image = Location { resource: image, kind: 0, footprint: upload };
-        let from = Location { resource: source, kind: 1, footprint: upload };
-        let source_box = [1u32, 1, 0, 3, 3, 1];
-        type Copy = extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u32);
-        let copy = slot::<Copy>(list, 0x80);
-        copy(list, &image, 0, 0, 0, &from, null.cast());
-        copy(list, &destination(ZERO_ORIGIN, 4, 4), 0, 0, 0, &image, source_box.as_ptr());
-        copy(list, &destination(OFFSET_ORIGIN, 4, 4), 1, 1, 0, &image, source_box.as_ptr());
-        copy(list, &destination(WHOLE_SOURCE, 6, 6), 0, 0, 0, &image, null.cast());
-        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
-        host.execute(&[crate::list::host_list(list).unwrap()]);
-
-        // SAFETY: execute waited for the GPU and landed the title readback.
-        let actual = unsafe { std::slice::from_raw_parts(result, BUFFER_BYTES) }.to_vec();
-        for object in [list, allocator, source, image.resource, output] {
-            slot::<Release>(object, 0x10)(object);
-        }
-
-        let mut expected = vec![SENTINEL; BUFFER_BYTES];
-        for row in 0..2 {
-            let from = (row + 1) * UPLOAD_PITCH + PIXEL_BYTES;
-            let pixels = &pattern[from..from + 2 * PIXEL_BYTES];
-            for to in [ZERO_ORIGIN + row * OUTPUT_PITCH, OFFSET_ORIGIN + (row + 1) * OUTPUT_PITCH + PIXEL_BYTES] {
-                expected[to..to + pixels.len()].copy_from_slice(pixels);
-                assert_eq!(&actual[to..to + pixels.len()], pixels, "copied row {row} at byte {to}");
-            }
-        }
-        for row in 0..4 {
-            let pixels = &pattern[row * UPLOAD_PITCH..row * UPLOAD_PITCH + IMAGE_WIDTH * PIXEL_BYTES];
-            let to = WHOLE_SOURCE + row * OUTPUT_PITCH;
-            expected[to..to + pixels.len()].copy_from_slice(pixels);
-            assert_eq!(&actual[to..to + pixels.len()], pixels, "whole-source row {row}");
-        }
-        let wrong = actual.iter().zip(&expected).position(|(got, want)| got != want);
-        if let Some(at) = wrong {
-            panic!("readback changed byte {at} outside the requested region: got {:#04x}, expected {:#04x}", actual[at], expected[at]);
-        }
-        println!("readback copied 96 bytes and preserved all 4000 surrounding bytes");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn boxed_upload_preserves_block_rows_and_tight_last_row() {
-        let original = PlacedFootprint { offset: 512, format: 71, width: 17, height: 16, depth: 1, row_pitch: 256 };
-        let mut region = [4, 8, 0, 16, 16, 1];
-        let (cropped, start, bytes) = original.crop_upload_rows(&mut region, original.bytes().unwrap()).unwrap();
-        assert_eq!((cropped.offset, cropped.width, cropped.height, cropped.row_pitch), (0, 17, 8, 256));
-        assert_eq!((start, bytes), (512, 296));
-        assert_eq!(region, [4, 0, 0, 16, 8, 1]);
-        // A partial block row or another depth slice keeps the full layout.
-        for (footprint, outside) in [
-            (original, [4, 2, 0, 16, 12, 1]),
-            (PlacedFootprint { depth: 2, ..original }, [4, 8, 1, 16, 16, 2]),
-        ] {
-            let mut region = outside;
-            assert!(footprint.crop_upload_rows(&mut region, footprint.bytes().unwrap()).is_none());
-            assert_eq!(region, outside);
-        }
     }
 }

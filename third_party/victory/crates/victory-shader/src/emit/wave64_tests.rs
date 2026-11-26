@@ -14,8 +14,6 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
-mod lanes;
-
 /// 64 threads in one console wave. Each thread t holds the bit `1 << (t >> 1)`; the threads
 /// below s0 (a root constant) OR theirs over the wave inside `if (t < s0) { ... }` and store
 /// the result to dword 0 of the raw UAV.
@@ -449,7 +447,7 @@ fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
 
 /// One `v_add_f16` whose exact result lies between two halves: 1 + 3/1024 (0x3C03) plus 2
 /// (0x4000) is 3 + 1.5 steps of that range, which the console rounds up to 0x4202. The
-/// host's `f32tof16` may give 0x4201 (toward zero); unless `VICTORY_F16_NEAREST=0` the
+/// host's `f32tof16` may give 0x4201 (toward zero); with `VICTORY_F16_NEAREST=1` the
 /// translation gives the console's whatever the host does.
 #[test]
 fn a_16_bit_sum_rounds_to_nearest_when_asked_to() {
@@ -1377,73 +1375,200 @@ fn both_host_waves_observe_the_lds_flag_after_the_join() {
     eprintln!("all 14 flag dispatches passed on a 32-lane hardware adapter");
 }
 
-/// A tree sum in LDS by one console wave of 64 with no barrier, as `compute_graph_ops`'
-/// `CS_DotOperation` ends: thread t writes the half 0x3C00 + 37 t at LDS[2t]; then the lanes
-/// below 32 add (`v_add_f16`), six times, the half `off` bytes on into their own (read, read,
-/// add, write). The console runs the lanes in step and its LDS in order, so lane 0 ends with
-/// the tree's sum. On the host the reads of a step must not move above the previous step's
-/// writes of other lanes (nor the writes above other lanes' reads).
-#[test]
-fn an_lds_tree_sum_of_one_wave_keeps_the_consoles_order() {
-    const DS_WRITE_B16: u32 = 0x1F;
-    const DS_READ_U16: u32 = 0x3C;
-    const WAIT_LDS: u32 = 0xBF8C_C07F; // s_waitcnt lgkmcnt(0)
-    let ds = |op: u32, vdst: u32, addr: u32, data0: u32, offset: u32| {
-        [0x36 << 26 | op << 18 | offset, vdst << 24 | data0 << 8 | addr]
-    };
-    let mut words = vec![
-        0x3402_0081, // v_lshlrev_b32 v1, 1, v0
-        0x340C_0085, // v_lshlrev_b32 v6, 5, v0
-        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
-        0x4A04_0506, // v_add_nc_u32 v2, v6, v2
-        0x4A04_0500, // v_add_nc_u32 v2, v0, v2
-        0x4A04_04FF,
-        0x0000_3C00, // v_add_nc_u32 v2, 0x3c00, v2
-    ];
-    words.extend(ds(DS_WRITE_B16, 0, 1, 2, 0));
-    words.push(WAIT_LDS);
-    words.push(0xBE86_047E); // s_mov_b64 s[6:7], exec
-    words.push(0x7DA8_00A0); // v_cmpx_gt_u32 exec, 32, v0
-    words.push(0xBF88_0000 | 6 * 6); // s_cbranch_execz past the tree
-    for off in [64, 32, 16, 8, 4, 2] {
-        words.extend(ds(DS_READ_U16, 2, 1, 0, 0));
-        words.extend(ds(DS_READ_U16, 3, 1, 0, off));
-        words.push(WAIT_LDS);
-        words.push(0x6404_0702); // v_add_f16 v2, v2, v3
-        words.extend(ds(DS_WRITE_B16, 0, 1, 2, 0));
-        words.push(WAIT_LDS);
-    }
-    words.push(0xBEFE_0406); // s_mov_b64 exec, s[6:7]
-    words.push(0x7DA4_0080); // v_cmpx_eq_u32 exec, 0, v0
-    words.extend(ds(DS_READ_U16, 0, 1, 0, 0));
-    words.push(WAIT_LDS);
+/// Lowers `body` as a console program of one 64-lane wave (or 32 when `wave64` is not set)
+/// for a host of 32-lane waves, validates it and runs it there; each lane stores v3 to dword
+/// v0 of the raw UAV. None where the host device does not run it.
+fn permuted(body: &[u32], wave64: bool) -> Option<Vec<u32>> {
+    let lanes = if wave64 { 64 } else { 32 };
+    let mut words = body.to_vec();
     words.extend_from_slice(&[
-        0x38 << 26 | 0x1C << 18,
-        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        0x340C_0082, // v_lshlrev_b32 v6, 2, v0
+        0xE070_1000,
+        0x8002_0306, // buffer_store_dword v3, v6, s[8:11], 0 offen
     ]);
-    let mut native = native(&words);
-    if let StageIo::Cs(cs) = &mut native.io {
-        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
-    }
+    let native = native_of(&words, wave64, lanes);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let shader = on_64_lanes(&native, &p);
-    // the console's steps: LDS[t] = LDS[t] + LDS[t + n] for every t < 32 at once, n = 32 .. 1,
-    // each addition rounded to 16 bits (to nearest, ties to even); values here are normal
-    let wide = |h: u16| f32::from_bits((u32::from(h >> 10) + 112) << 23 | u32::from(h & 0x3FF) << 13);
-    let narrow = |f: f32| {
-        let b = f.to_bits();
-        let h = ((b >> 23) - 112) << 10 | (b >> 13 & 0x3FF);
-        let rest = b & 0x1FFF;
-        (h + u32::from(rest > 0x1000 || rest == 0x1000 && h & 1 == 1)) as u16
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    // The same program for a host of 64-lane waves lowers too.
+    let wide = lowered_on(&native, &p, &HashSet::new(), 64).expect("lower for 64-lane waves");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = wide.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed (64-lane waves)");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return None;
     };
-    let mut lds: Vec<u16> = (0..64u16).map(|t| 0x3C00 + 37 * t).collect();
-    for n in [32, 16, 8, 4, 2, 1] {
-        let before = lds.clone();
-        for t in 0..32 {
-            lds[t] = narrow(wide(before[t]) + wide(before[t + n]));
-        }
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return None;
+    };
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                views: &[View::RawUav(lanes)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    Some(out[0][..lanes as usize].to_vec())
+}
+
+/// A wave64 `ds_bpermute_b32` permutes lanes 0..31 and 32..63 apart (RDNA 2 ISA, section
+/// 10.4.4; upstream 0665a0e8, #573): v1 = ((lane & 31) << 2) + 0x103 with offset 12 drops the
+/// high and sub-dword address bits and wraps inside each half (lanes 29..31 read 0..2, lanes
+/// 61..63 read 32..34, lane 32 reads lane 35, not lane 3). Run in host waves of 32, the
+/// program needs no exchange between them.
+#[test]
+fn a_wave64_backward_permute_stays_within_each_32_lane_half() {
+    let body = [
+        0x4A04_00FF,
+        0x0000_4000, // v_add_nc_u32 v2, 0x4000, v0
+        0x3602_009F, // v_and_b32 v1, 31, v0
+        0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+        0x4A02_02FF,
+        0x0000_0103, // v_add_nc_u32 v1, 0x103, v1
+        0xDACC_000C,
+        0x0300_0201, // ds_bpermute_b32 v3, v1, v2 offset:12
+    ];
+    let Some(got) = permuted(&body, true) else { return };
+    let want: Vec<u32> = (0..64).map(|l| 0x4000 + ((l & !31) | ((l + 3) & 31))).collect();
+    assert_eq!(got, want);
+    eprintln!("ran on the hardware device: each half permuted on its own");
+}
+
+/// EXEC is per half too: with lanes 0..39 active, lanes 32..39 read upper-half lanes 40..47,
+/// which are inactive, and get 0 although lower-half lanes 8..15 are active. Lanes 40..63
+/// keep their v3.
+#[test]
+fn a_wave64_backward_permute_reads_exec_within_each_half() {
+    let body = [
+        0x4A04_00FF,
+        0x0000_5000, // v_add_nc_u32 v2, 0x5000, v0
+        0x4A06_00FF,
+        0xCAFE_0000, // v_add_nc_u32 v3, 0xcafe0000, v0
+        0x4A02_0088, // v_add_nc_u32 v1, 8, v0
+        0x3602_029F, // v_and_b32 v1, 31, v1
+        0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+        0xDACC_0000,
+        0x0300_0201, // ds_bpermute_b32 v3, v1, v2
+        0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+    ];
+    let Some(got) = permuted(&body, true) else { return };
+    let want: Vec<u32> = (0..64)
+        .map(|l| match l {
+            0..32 => 0x5000 + ((l + 8) & 31),
+            32..40 => 0,
+            _ => 0xCAFE_0000 + l,
+        })
+        .collect();
+    assert_eq!(got, want);
+    eprintln!("ran on the hardware device: inactive lanes of the same half read 0");
+}
+
+/// A wave32 backward permute names lanes by bits 6:2 of the address: the high bits (0x100)
+/// and sub-dword bits (+3) are dropped.
+#[test]
+fn a_wave32_backward_permute_drops_the_high_and_sub_dword_address_bits() {
+    let body = [
+        0x4A04_00FF,
+        0x0000_3000, // v_add_nc_u32 v2, 0x3000, v0
+        0x4A02_0088, // v_add_nc_u32 v1, 8, v0
+        0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+        0x4A02_02FF,
+        0x0000_0103, // v_add_nc_u32 v1, 0x103, v1
+        0xDACC_0000,
+        0x0300_0201, // ds_bpermute_b32 v3, v1, v2
+    ];
+    let Some(got) = permuted(&body, false) else { return };
+    let want: Vec<u32> = (0..32).map(|l| 0x3000 + ((l + 8) & 31)).collect();
+    assert_eq!(got, want);
+}
+
+/// A console wave32 program with console lanes (`v_mbcnt`) in a 32 x 2 group: thread (x, y)
+/// stores 1 at dword 32y + x. Every dword must be written once: the host's relabelled thread
+/// ids are a bijection of the group. A 32-lane host need not give a host wave a 32-aligned run
+/// of flat ids (2-D groups are filled from 16 x 2 tiles on NVIDIA and RDNA), so the first flat
+/// id of a wave rounded down gave two waves the same ids (issue #1243); the waves now take
+/// their threads from a group counter. With `VICTORY_THREAD_TICKET=0` (the old rounding) the
+/// count of dwords written is printed, not checked: it depends on the card.
+#[test]
+fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
+    let words = [
+        0xD765_0003, // v_mbcnt_lo_u32_b32 v3, exec_lo, 0
+        0x0001_007E,
+        0x3408_0285, // v_lshlrev_b32 v4, 5, v1
+        0x4A08_0104, // v_add_nc_u32 v4, v4, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 5 << 8 | 4, // buffer_store_dword v5, v4, s[8:11], 0 offen
+    ];
+    let mut native = native_of(&words, false, 64);
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: 5 << 1 | 1 << 11, // 5 user SGPRs, thread ids x and y in v0, v1
+        threads: [32, 2, 1],
+    });
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let lower_with = |ticket: bool| {
+        // SAFETY: tests that read this switch hold ONE_AT_A_TIME
+        unsafe { std::env::set_var("VICTORY_THREAD_TICKET", if ticket { "1" } else { "0" }) };
+        let shader = lowered_on(&native, &p, &HashSet::new(), 32);
+        unsafe { std::env::remove_var("VICTORY_THREAD_TICKET") };
+        shader.expect("lower")
+    };
+    let shader = lower_with(true);
+    let old = lower_with(false);
+    assert_ne!(shader.dxil, old.dxil, "the counter is used for a group of two host waves");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
     }
-    if let Some(got) = dispatched(&shader, &[]) {
-        assert_eq!(got & 0xFFFF, u32::from(lds[0]), "lane 0's sum after the console's tree");
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let run = |shader: &HostShader| -> Option<Vec<u32>> {
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("the hardware device does not take this program: {e}; not run");
+                return None;
+            }
+        };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        Some(out[0][..64].to_vec())
+    };
+    let Some(got) = run(&shader) else { return };
+    let missing: Vec<usize> = (0..64).filter(|&i| got[i] != 1).collect();
+    assert!(missing.is_empty(), "dwords not written once: {missing:?}");
+    if let Some(before) = run(&old) {
+        let written = before.iter().filter(|&&d| d == 1).count();
+        eprintln!("the old rounding on this device: {written} of 64 dwords written");
     }
+    eprintln!("ran on the hardware device: 64 of 64 console threads, each once");
 }

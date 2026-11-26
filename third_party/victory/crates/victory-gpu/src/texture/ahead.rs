@@ -104,8 +104,6 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         let way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
         return way.iter().find(|(serial, _)| *serial == copy.serial).map(|(_, job)| Taken::Known(job.clone()));
     }
-    // (`VICTORY_RESIDENCY=1`: less on its way with 32 GiB of RAM or less,
-    // none while commit is short.)
     let most = if crate::residency::limited_host_ram() { 32 << 20 } else { MOST };
     if !crate::residency::allow_staging_growth(false)
         || BYTES.load(Relaxed) >= most
@@ -265,8 +263,6 @@ impl Worker {
     fn copy(&self, jobs: &[Arc<Job>], value: u64) -> windows::core::Result<()> {
         for job in jobs {
             job.staging.refresh();
-            // What the copy below puts in the host copy (`super::late_uploads`).
-            job.staging.held.fetch_max(job.staging.detiles.load(Relaxed), Relaxed);
         }
         // SAFETY: this worker's allocator and list, whose last submission has
         // run; the jobs hold what the list names until after the wait.

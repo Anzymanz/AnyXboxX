@@ -67,9 +67,6 @@ pub(crate) struct Shader {
     /// Its part in the light probe (`crate::lightprobe`).
     #[cfg(windows)]
     pub(crate) probe: Option<crate::lightprobe::Role>,
-    /// The text of `VICTORY_DISPATCH_DUMP_NAMES` it holds (`crate::dispatchdump`).
-    #[cfg(all(windows, feature = "diagnostics"))]
-    pub(crate) dump: Option<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -124,8 +121,6 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 probe: crate::lightprobe::on().then(|| crate::lightprobe::role(bytes)).flatten(),
-                #[cfg(all(windows, feature = "diagnostics"))]
-                dump: crate::dispatchdump::role(bytes, &full.to_hex()[..16]),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -470,13 +465,6 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
-}
-
-/// Whether `this` runs a compute program the title dispatches once
-/// (`make::ONE_SHOT`), whose dropped dispatch is never made up for.
-#[cfg(windows)]
-pub(crate) fn is_one_shot(this: This) -> bool {
-    !this.is_null() && make::is_one_shot(&pipeline(this).host)
 }
 
 /// Host pipelines queued and not made yet.

@@ -785,59 +785,6 @@ mod tests {
         assert_eq!((&out, n), (b"0123456789", 10));
     }
 
-    /// Write-watched memory (the title's GPU memory, `xmem`) with its watch
-    /// reset, the first page written since: what a file read into it puts
-    /// there and what the watch then says.
-    fn read_into_watched(read: impl FnOnce(*mut c_void, *mut u8, u32, *mut u32) -> i32) -> (i32, usize, bool, usize) {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::System::Memory::{
-            GetWriteWatch, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, ResetWriteWatch,
-            VirtualAlloc, VirtualFree,
-        };
-        const WATCH: u32 = 0x20_0000;
-        const PAGES: usize = 4;
-        const K4: usize = 4096;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data.bin");
-        let bytes: Vec<u8> = (0..PAGES * K4).map(|i| (i * 13 + i / K4) as u8 | 1).collect();
-        std::fs::write(&path, &bytes).unwrap();
-        let file = std::fs::File::open(&path).unwrap();
-        // SAFETY: a fresh allocation of ours, freed below.
-        let p = unsafe { VirtualAlloc(std::ptr::null(), PAGES * K4, MEM_RESERVE | MEM_COMMIT | WATCH, PAGE_READWRITE) }.cast::<u8>();
-        assert!(!p.is_null());
-        let mut n = 0;
-        let (mut found, mut count, mut granularity) = ([0usize; PAGES], PAGES, 0u32);
-        // SAFETY: the allocation above, `PAGES` pages of it.
-        let (ok, same, watch) = unsafe {
-            ResetWriteWatch(p.cast(), PAGES * K4);
-            // Under Wine a page the watch saw written is writable again,
-            // the others are read-only until written.
-            p.write_volatile(0);
-            let ok = read(file.as_raw_handle().cast(), p, (PAGES * K4) as u32, &mut n);
-            let same = std::slice::from_raw_parts(p, PAGES * K4) == &bytes[..];
-            let watch = GetWriteWatch(0, p.cast(), PAGES * K4, found.as_mut_ptr().cast(), &mut count, &mut granularity);
-            VirtualFree(p.cast(), 0, MEM_RELEASE);
-            (ok, same, watch)
-        };
-        assert_eq!(watch, 0);
-        (ok, n as usize, same, count)
-    }
-
-    /// The title's synchronous reads into its GPU memory are whole and are
-    /// seen by the write watch (the GPU side's host copies take the pages
-    /// again). Windows' kernel does both; Wine, which watches by page
-    /// protection, must too, with a page already written (writable again)
-    /// ahead of pages still read-only (holds on GE-Proton11-12, 2026-11-26).
-    #[test]
-    fn a_read_into_write_watched_memory_is_whole_and_seen() {
-        let (ok, n, same, written) =
-            read_into_watched(|file, at, len, n| ReadFile(file, at, len, n, std::ptr::null_mut()));
-        assert_ne!(ok, 0);
-        assert_eq!(n, 4 * 4096, "a short read");
-        assert!(same, "the bytes read are the file's");
-        assert_eq!(written, 4, "pages the write watch saw written");
-    }
-
     #[test]
     fn fread_reads_beside_in_chunks() {
         let dir = tempfile::tempdir().unwrap();

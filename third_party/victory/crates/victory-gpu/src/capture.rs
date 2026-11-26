@@ -855,65 +855,6 @@ pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
     }
 }
 
-/// Diagnostics (`VICTORY_ORDER_TRACE=1`): whether a presented picture, as
-/// [`probe`] read it, is one shown a few presents before and not the last
-/// one: a picture that went back in time (a video frame or an animation
-/// shown out of order; a blinking element also does it). Logged with the
-/// presents it went back to, and counted every 256 presents.
-pub(crate) fn order(frame: u64, buffer: &ID3D12Resource) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_ORDER_TRACE").is_some_and(|v| v != "0")) {
-        return;
-    }
-    let mut data = std::ptr::null_mut();
-    // SAFETY: the copies finished (the present's copy is waited for).
-    let hash = unsafe {
-        if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return;
-        }
-        let bytes = std::slice::from_raw_parts(data.cast::<u8>(), (SLOT * u64::from(GRID * GRID)) as usize);
-        let hash = bytes.chunks(SLOT as usize).fold(0xcbf2_9ce4_8422_2325u64, |h, pixel| {
-            pixel[..4].iter().fold(h, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
-        });
-        buffer.Unmap(0, None);
-        hash
-    };
-    static SEEN: std::sync::Mutex<(std::collections::VecDeque<(u64, u64)>, u64, u64)> =
-        std::sync::Mutex::new((std::collections::VecDeque::new(), 0, 0));
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    let (recent, presents, back) = &mut *seen;
-    *presents += 1;
-    if let Some(was) = went_back(recent, hash) {
-        *back += 1;
-        if *back <= 400 {
-            tracing::warn!(
-                frame,
-                shown_at = was,
-                presents_back = frame.saturating_sub(was),
-                last = ?recent.iter().rev().take(6).map(|&(f, h)| (f, h as u16)).collect::<Vec<_>>(),
-                "order: a present showed a picture shown before and not the last one (VICTORY_ORDER_TRACE)"
-            );
-        }
-    }
-    if *presents % 256 == 0 {
-        tracing::info!(presents = *presents, went_back = *back, "order: presents whose picture went back to an earlier one, since the start (VICTORY_ORDER_TRACE)");
-    }
-    if recent.len() == 16 {
-        recent.pop_front();
-    }
-    recent.push_back((frame, hash));
-}
-
-/// The present an earlier picture `hash` was shown at, if it is among the
-/// `recent` ones (present, picture; oldest first) and not the last.
-fn went_back(recent: &std::collections::VecDeque<(u64, u64)>, hash: u64) -> Option<u64> {
-    let &(_, last) = recent.back()?;
-    if last == hash {
-        return None;
-    }
-    recent.iter().rev().skip(1).find(|&&(_, h)| h == hash).map(|&(f, _)| f)
-}
-
 /// The brightest probed channel of the last frames, oldest first: a fade
 /// darkens over several, a glitch drops at once.
 static LEVELS: std::sync::Mutex<std::collections::VecDeque<u8>> =
@@ -926,15 +867,6 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn a_picture_shown_again_after_another_went_back() {
-        let recent: std::collections::VecDeque<(u64, u64)> = [(1, 10), (2, 20), (3, 30)].into_iter().collect();
-        assert_eq!(super::went_back(&recent, 30), None, "the same picture again: a frame held");
-        assert_eq!(super::went_back(&recent, 40), None, "a new picture");
-        assert_eq!(super::went_back(&recent, 10), Some(1));
-        assert_eq!(super::went_back(&std::collections::VecDeque::new(), 10), None);
-    }
-
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);

@@ -1032,6 +1032,15 @@ pub(crate) fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE").is_none_or(|v| v != "0"))
 }
 
+/// Tests that go through the submission's one asking ([`ask_once`]) hold
+/// this while they run: the asking is global, so two tests asking at once end
+/// each other's, and a write one of them waits for can be taken by the other.
+#[cfg(test)]
+pub(crate) fn one_asking_test() -> std::sync::MutexGuard<'static, ()> {
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ONE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// With [`once`]: asks about `ranges` (everything a submission's lists
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
 /// [`ask_once_end`].
@@ -1393,12 +1402,7 @@ impl Tracked {
         if from >= to {
             return Vec::new();
         }
-        let asked = writes(from, to, true);
-        // Diagnostic: all of it, whatever was asked.
-        if refreshes_all(ALL_RECORDS) {
-            return vec![(from, to)];
-        }
-        let Some((_, pages)) = asked else {
+        let Some((_, pages)) = writes(from, to, true) else {
             return Vec::new();
         };
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
@@ -3292,10 +3296,7 @@ impl Drop for KernelWrite {
 /// 4, both also for reads to plain addresses when they have finished.
 /// Unset or `guards`: bit 1 alone. `0`: nothing, counted only (the default
 /// until run 199). `1`: bits 1 and 2. `slots`: bit 2 alone. `all`:
-/// everything. `5` (also `guards+reads`): bits 1 and 4, the host copies
-/// under reads to plain addresses taken again too, without making texture
-/// slots due; and any other number from 2 to 7 is taken as the bits
-/// themselves ([`page_writes_mode`]).
+/// everything.
 /// (Bit 1 by default: in every run 10,000 to 50,000 guarded blocks of host
 /// copies lay under such writes and kept the bytes from before; runs 197
 /// and 198 opened them, 9,766 and 10,796 blocks, with nothing worse for
@@ -3303,77 +3304,13 @@ impl Drop for KernelWrite {
 /// queue in an earlier form: still asked for by name.)
 pub(crate) fn page_writes() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| page_writes_mode(std::env::var("VICTORY_PAGE_WRITES").ok().as_deref()))
-}
-
-/// [`page_writes`] from the switch's value. `1` keeps its meaning (bits 1
-/// and 2, as before); other numbers up to 7 are the bits.
-fn page_writes_mode(value: Option<&str>) -> u8 {
-    match value.map(str::trim) {
-        Some("0") => 0,
-        Some("1") => 3,
-        Some("slots") => 2,
-        Some("all") => 7,
-        Some("guards+reads") => 5,
-        Some(v) => v.parse::<u8>().ok().filter(|&bits| (2..=7).contains(&bits)).unwrap_or(1),
-        None => 1,
-    }
-}
-
-/// Diagnostic (`VICTORY_REFRESH_ALL`; off by default): what is taken again
-/// from title memory at every refresh, whatever the write watch, the guards
-/// and the journal say, as bits ([`refresh_all_mode`]). Slow, but it holds
-/// by construction what the title wrote before it submitted, however it
-/// wrote it (a write nothing told of shows as a difference):
-/// 1 ([`ALL_COPIES`]), every buffer's host copy, windows and copies in the
-/// card's memory too: the whole range a refresh names is copied and sent up
-/// to the card ([`crate::shadow::Shadow::update`]);
-/// 2 ([`ALL_PICKED`]), the buffers shaders pick from the heap by index are
-/// refreshed for every list that runs such a shader, not once a frame
-/// (`crate::draw`, `heap_buffers`);
-/// 4 ([`ALL_RECORDS`]), descriptor heaps' records are read whole at every
-/// look, not only the pages written since ([`Tracked::take`]);
-/// 8 ([`ALL_TEXTURES`]), textures are read and detiled again at every
-/// refresh (`crate::texture`).
-/// `1`: bit 1 alone. `all`: everything. Other numbers up to 15: the bits.
-/// What the card reads in place (renderer port 1, `VICTORY_PORT_CONSTANTS`,
-/// and other in-place heaps) has no copy and is left as it is.
-pub(crate) fn refresh_all() -> u8 {
-    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        let mode = refresh_all_mode(std::env::var("VICTORY_REFRESH_ALL").ok().as_deref());
-        if mode != 0 {
-            tracing::warn!(
-                mode,
-                copies = mode & ALL_COPIES != 0,
-                picked = mode & ALL_PICKED != 0,
-                records = mode & ALL_RECORDS != 0,
-                textures = mode & ALL_TEXTURES != 0,
-                "VICTORY_REFRESH_ALL: host copies of title memory are taken whole at every refresh (diagnostic, slow)"
-            );
-        }
-        mode
+    *MODE.get_or_init(|| match std::env::var("VICTORY_PAGE_WRITES").as_deref().map(str::trim) {
+        Ok("0") => 0,
+        Ok("1") => 3,
+        Ok("slots") => 2,
+        Ok("all") => 7,
+        _ => 1,
     })
-}
-
-/// [`refresh_all`]'s bits.
-pub(crate) const ALL_COPIES: u8 = 1;
-pub(crate) const ALL_PICKED: u8 = 2;
-pub(crate) const ALL_RECORDS: u8 = 4;
-pub(crate) const ALL_TEXTURES: u8 = 8;
-
-/// Whether [`refresh_all`] has `bit`.
-pub(crate) fn refreshes_all(bit: u8) -> bool {
-    refresh_all() & bit != 0
-}
-
-/// [`refresh_all`] from the switch's value.
-fn refresh_all_mode(value: Option<&str>) -> u8 {
-    match value.map(str::trim) {
-        None | Some("" | "0") => 0,
-        Some("all") => 15,
-        Some(v) => v.parse::<u8>().map_or(0, |bits| bits & 15),
-    }
 }
 
 /// Since the start: writes into physical pages through the runtime's own
@@ -3695,7 +3632,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texback::remapped(at, len);
-    open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
+    open(&title_memory_changed(at, len), at, at.saturating_add(len));
 }
 
 /// The runtime is about to unmap title memory `[at, at + len)`: it is
@@ -4023,41 +3960,6 @@ mod parts_tests {
         // A page never written before: what was not named was never written.
         assert_eq!(j.note(9, 0b100, 9), 0);
         assert_eq!(j.parts_since(9, 5), 0b100);
-    }
-}
-
-#[cfg(test)]
-mod page_writes_tests {
-    use super::page_writes_mode;
-
-    #[test]
-    fn refresh_all_is_off_unless_asked_and_takes_bits() {
-        use super::refresh_all_mode;
-        assert_eq!(refresh_all_mode(None), 0);
-        assert_eq!(refresh_all_mode(Some("0")), 0);
-        assert_eq!(refresh_all_mode(Some("1")), 1);
-        assert_eq!(refresh_all_mode(Some(" 3 ")), 3);
-        assert_eq!(refresh_all_mode(Some("all")), 15);
-        assert_eq!(refresh_all_mode(Some("31")), 15);
-        assert_eq!(refresh_all_mode(Some("yes")), 0);
-    }
-
-    #[test]
-    fn page_writes_takes_its_names_and_the_bits_as_a_number() {
-        // The names keep their meanings.
-        assert_eq!(page_writes_mode(None), 1);
-        assert_eq!(page_writes_mode(Some("guards")), 1);
-        assert_eq!(page_writes_mode(Some("0")), 0);
-        assert_eq!(page_writes_mode(Some("1")), 3);
-        assert_eq!(page_writes_mode(Some("slots")), 2);
-        assert_eq!(page_writes_mode(Some("all")), 7);
-        // Host copies under finished reads too, texture slots left alone.
-        assert_eq!(page_writes_mode(Some("5")), 5);
-        assert_eq!(page_writes_mode(Some(" guards+reads ")), 5);
-        assert_eq!(page_writes_mode(Some("6")), 6);
-        // Not a mode: the default.
-        assert_eq!(page_writes_mode(Some("8")), 1);
-        assert_eq!(page_writes_mode(Some("many")), 1);
     }
 }
 
@@ -5937,6 +5839,7 @@ mod port7_tests {
     /// before asking is told of that write.
     #[test]
     fn no_write_is_lost_with_port_7() {
+        let _one = one_asking_test();
         askers_and_a_submission(1);
         askers_and_a_submission(2);
     }

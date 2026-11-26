@@ -56,36 +56,32 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
-/// A pipeline that is never made, and why: the ray-tracing resolve programs
-/// without the builder (`VICTORY_RT_RESOLVE=0`: some 1,000 of them shade no
-/// hits then and fill a cold queue) and the ray activation program
-/// (`VICTORY_ACTIVATE_RAYS=0`). From codec-d/cool_fox, where both are left
-/// out by default; here only when asked.
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
-        std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
-            && std::env::var_os("VICTORY_RT_RESOLVE").is_some_and(|v| v == "0")
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        if builder {
+            return false;
+        }
+        // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
+        // clogging the cold compiler queue; skip unless VICTORY_RT_RESOLVE=1.
+        std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v == "0")
     });
     if skip_rt && named(shaders, b"CS_RaytracingResolve") {
         return Some("shades ray-tracing hits without BVH, left out");
     }
     static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
-    let skip_activate =
-        *SKIP_ACTIVATE_RAYS.get_or_init(|| std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0"));
+    let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        if builder {
+            return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
+        }
+        std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
+    });
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
     }
     None
-}
-
-/// Whether the first scene's known producers ([`scene_input`]) are made at
-/// once at creation, ahead of the queue, and passes over the screen with a
-/// mesh stage are not taken first (`VICTORY_SCENE_INPUTS=1`, from
-/// codec-d/cool_fox; off by default).
-fn scene_inputs() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SCENE_INPUTS").is_some_and(|v| v == "1"))
 }
 
 /// Confirmed first-scene producers. Prepare these at creation even on a cold
@@ -104,32 +100,6 @@ fn scene_input(shaders: &[Arc<Shader>]) -> bool {
     })
 }
 
-/// Compute programs the title dispatches once (when a character is made, say)
-/// whose results passes read every frame after: dropped while their pipeline
-/// is being made, that result is never made. They are made at the title's
-/// creation of the pipeline, and their dispatches wait for them like passes
-/// over the screen ([`screen_budget`]).
-///
-/// - `61e54e90adccaf6a` `ped_standard_head_cs:CS_ComputeBlendshapeMappings`:
-///   fills a head's blendshape mapping table (one entry per vertex), which
-///   the title clears to all ones; `CS_BlendshapeTranslationsHSSGraphOutputExtract`
-///   and `CS_ReconstructBlendshapeNormals` read it every frame. A run with
-///   `VICTORY_PIPELINE_WAIT_MS=0` (run.sh's default) had its first dispatch
-///   dropped, the table stayed all ones to the end and the faces were
-///   deformed (dispatch dump face-dispatch2: the mapping table read at
-///   0xf15521920 all ones, the first mapping dispatch that ran 5 s after the
-///   first extract, for another head).
-const ONE_SHOT: &[&str] = &["61e54e90adccaf6a"];
-
-fn one_shot(shaders: &[Arc<Shader>]) -> bool {
-    shaders.iter().any(|s| s.stage == "compute" && ONE_SHOT.contains(&s.hash.as_str()))
-}
-
-/// Whether `p` is one of the [`ONE_SHOT`] programs.
-pub(crate) fn is_one_shot(p: &Pending) -> bool {
-    one_shot(&p.shaders)
-}
-
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
 // elements point into its own names) is only read after creation.
 unsafe impl Send for Pending {}
@@ -144,13 +114,10 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
-        let scene_input = scene_inputs() && scene_input(&shaders) || one_shot(&shaders);
-        let screen = if scene_inputs() {
-            (graphics.as_ref().is_some_and(|g| g.screen_pass()) && shaders.iter().all(|s| s.stage != "mesh"))
-                || scene_input
-        } else {
-            graphics.as_ref().is_some_and(|g| g.screen_pass()) || scene_input
-        };
+        let scene_input = scene_input(&shaders);
+        let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
+            && shaders.iter().all(|s| s.stage != "mesh"))
+            || scene_input;
         let left_out = left_out(&shaders);
         Pending {
             screen,
@@ -594,36 +561,6 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The blendshape mapping program is made at creation and waited for
-    /// like a pass over the screen, whatever the switches.
-    #[test]
-    fn one_shot_producers_are_made_at_creation_and_waited_for() {
-        let shader = |hash: &str| {
-            Arc::new(Shader {
-                stage: "compute",
-                hash: hash.to_owned(),
-                container: Vec::new(),
-                #[cfg(windows)]
-                ambient: None,
-                #[cfg(windows)]
-                probe: None,
-                #[cfg(all(windows, feature = "diagnostics"))]
-                dump: None,
-                #[cfg(windows)]
-                translated: OnceLock::new(),
-            })
-        };
-        let mappings = Pending::new(vec![shader("61e54e90adccaf6a")], None);
-        assert!(mappings.scene_input && mappings.screen);
-        let other = Pending::new(vec![shader("0123456789abcdef")], None);
-        assert!(!other.screen);
-        let mut mappings = mappings;
-        mappings.key = "one-shot-producer-test".to_owned();
-        let mappings = Arc::new(mappings);
-        early(&mappings);
-        assert_ne!(mappings.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
-    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {

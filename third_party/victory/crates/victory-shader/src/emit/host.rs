@@ -1116,18 +1116,9 @@ pub enum View<'a> {
     UintTextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
-    /// A typed buffer UAV pre-filled with `data` (`format`, bytes per element;
-    /// `R32_TYPELESS`: a raw view).
+    /// A typed buffer UAV pre-filled with `data` (`format`, bytes per element).
     TypedUav {
         data: &'a [u32],
-        format: DXGI_FORMAT,
-        elem_bytes: u32,
-    },
-    /// Another UAV (no data, no output of its own) over the buffer of the
-    /// [`View::TypedUav`] at view index `of`, in `format` (`R32_TYPELESS`:
-    /// raw): views of one buffer, as a title binds them.
-    AliasUav {
-        of: usize,
         format: DXGI_FORMAT,
         elem_bytes: u32,
     },
@@ -1292,9 +1283,6 @@ impl Host {
             let mut keep = Vec::new();
             // UAVs: (resource, dwords or texture size, readback buffer).
             let mut uavs = Vec::new();
-            // The typed UAVs' buffers and dwords by view index ([`View::AliasUav`]).
-            let mut buffers: std::collections::HashMap<usize, (ID3D12Resource, u32)> =
-                std::collections::HashMap::new();
             for (i, v) in d.views.iter().enumerate() {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
@@ -1436,12 +1424,7 @@ impl Host {
                             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                                 Buffer: D3D12_BUFFER_UAV {
                                     NumElements: elements,
-                                    // R32_TYPELESS: a raw view over the data.
-                                    Flags: if format == DXGI_FORMAT_R32_TYPELESS {
-                                        D3D12_BUFFER_UAV_FLAG_RAW
-                                    } else {
-                                        D3D12_BUFFER_UAV_FLAG_NONE
-                                    },
+                                    Flags: D3D12_BUFFER_UAV_FLAG_NONE,
                                     ..Default::default()
                                 },
                             },
@@ -1452,31 +1435,7 @@ impl Host {
                             &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        buffers.insert(i, (b.clone(), n));
                         uavs.push((b, None, n, rb));
-                    }
-                    View::AliasUav {
-                        of,
-                        format,
-                        elem_bytes,
-                    } => {
-                        let (b, n) = buffers.get(&of).ok_or("an alias of no typed UAV before it")?;
-                        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                            Format: format,
-                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                                Buffer: D3D12_BUFFER_UAV {
-                                    NumElements: (u64::from(*n) * 4 / u64::from(elem_bytes)) as u32,
-                                    Flags: if format == DXGI_FORMAT_R32_TYPELESS {
-                                        D3D12_BUFFER_UAV_FLAG_RAW
-                                    } else {
-                                        D3D12_BUFFER_UAV_FLAG_NONE
-                                    },
-                                    ..Default::default()
-                                },
-                            },
-                        };
-                        dev.CreateUnorderedAccessView(b, None, Some(&desc), at);
                     }
                     View::TextureUav(w, h) => {
                         let t = make(

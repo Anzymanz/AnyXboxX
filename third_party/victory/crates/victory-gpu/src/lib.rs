@@ -25,8 +25,6 @@ mod texlate;
 mod texstore;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod dispatchdump;
 #[cfg(windows)]
 mod compose;
 pub mod console;
@@ -43,10 +41,17 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+pub mod frametime;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]
 mod host;
+// (AnyXboxX) The Neptune overlay; its screenshot helpers wait for an F12 capture.
+#[allow(dead_code)]
+mod overlay;
+#[allow(dead_code)]
+mod pixels;
+mod screenshot;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
@@ -61,6 +66,8 @@ pub mod port_descriptors;
 mod port_journal;
 #[cfg(windows)]
 mod land;
+#[cfg(all(test, windows))]
+mod loadprobe;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -90,7 +97,6 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod shadow;
-mod resultring;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;

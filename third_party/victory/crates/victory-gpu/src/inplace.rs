@@ -244,69 +244,6 @@ pub(crate) fn open(device: &ID3D12Device, from: From) -> windows::core::Result<I
     }
 }
 
-/// Whether a heap opened by the address of a view of a committed section
-/// (renderer port 1's way, [`From::Part`]) is that section's memory to the
-/// card: tried once on a section of our own, as the probe's view check
-/// does, the answer kept. Under Wine (vkd3d-proton on RADV, 2026-11-26) the
-/// opening succeeds and the heap is other memory: the card reads none of
-/// the bytes the CPU wrote there, before or after, and the CPU none of the
-/// card's (`card_probe_and_the_port_gate_agree_on_section_views`).
-/// `VICTORY_PORT_VIEW_CHECK=0`: not tried, taken for yes, as before.
-pub(crate) fn views_in_place(device: &ID3D12Device) -> bool {
-    static SEEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SEEN.get_or_init(|| {
-        if std::env::var_os("VICTORY_PORT_VIEW_CHECK").is_some_and(|v| v == "0") {
-            return true;
-        }
-        let seen = Rig::new(device).is_ok_and(|mut rig| {
-            // SAFETY: the section and view of our own, made and let go here.
-            unsafe { view_seen(&mut rig) }
-        });
-        if seen {
-            tracing::info!("in place: the card sees a section's bytes through a heap opened on a view of it");
-        } else {
-            tracing::warn!(
-                "in place: a heap opened on a view of a section is not that memory to the card (shared memory the driver does not \
-                 take): title memory that is a view of physical pages is not put in place (renderer port 1 stays off)"
-            );
-        }
-        seen
-    })
-}
-
-/// [`views_in_place`]'s try: the card reads the bytes the CPU wrote, before
-/// and after the opening, and the CPU reads the card's.
-unsafe fn view_seen(rig: &mut Rig) -> bool {
-    const SIZE: usize = 4 * K64;
-    // SAFETY (the whole function): the section and the view made here.
-    unsafe {
-        let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-        let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, SIZE as u32, std::ptr::null());
-        if handle.is_null() {
-            return false;
-        }
-        let view = mem::MapViewOfFile(handle, mem::FILE_MAP_WRITE, 0, 0, SIZE);
-        let at = view.Value.cast::<u8>();
-        let seen = !at.is_null() && {
-            fill(at, SIZE, 17);
-            open(&rig.device, From::Part(at as usize, SIZE)).is_ok_and(|heap| {
-                place(&rig.device, &heap, 0, K64 as u64).is_ok_and(|buffer| {
-                    let before = rig.fetch(&buffer, 0, K64).is_ok_and(|got| same(at, &got));
-                    fill(at, K64, 101);
-                    let after = rig.fetch(&buffer, 0, K64).is_ok_and(|got| same(at, &got));
-                    let new: Vec<u8> = (0..K64).map(|i| (i as u8) ^ 0x6c).collect();
-                    before && after && rig.store(&buffer, 0, &new).is_ok() && same(at, &new)
-                })
-            })
-        };
-        if !at.is_null() {
-            mem::UnmapViewOfFile(view);
-        }
-        windows_sys::Win32::Foundation::CloseHandle(handle);
-        seen
-    }
-}
-
 fn buffer_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
     D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -909,13 +846,6 @@ pub(crate) struct Probe {
     /// A section made with `SEC_RESERVE` (as `xmem` makes the page pool)
     /// was refused.
     pub(crate) reserved_section_refused: bool,
-    /// A view of a committed section opened by its address
-    /// (`OpenExistingHeapFromAddress1`, as renderer port 1 opens the
-    /// title's graphics memory): the GPU reads the bytes the CPU wrote
-    /// there, before and after the opening, and the CPU reads what the GPU
-    /// wrote (by a copy).
-    pub(crate) view_reads: bool,
-    pub(crate) view_writes: bool,
 }
 
 /// Tries the openings on memory of the probe's own, made the way `xmem`
@@ -953,9 +883,8 @@ pub(crate) fn probe(device: &ID3D12Device, memory: &dyn Fn() -> Option<[u64; 4]>
     }
     p.lines.push(format!(
         "VERDICT: private memory in place: reads {}, writes {}; the page pool's section in place: reads {}, writes {}, whatever the views do {}; \
-         a section's view by its address (renderer port 1): reads {}, writes {}; \
          a reserved section is refused {} (the pool must be made committed to be opened)",
-        p.part_reads, p.part_writes, p.section_reads, p.section_writes, p.section_outlives_views, p.view_reads, p.view_writes, p.reserved_section_refused
+        p.part_reads, p.part_writes, p.section_reads, p.section_writes, p.section_outlives_views, p.reserved_section_refused
     ));
     p
 }
@@ -1067,30 +996,6 @@ unsafe fn section(p: &mut Probe, rig: &mut Rig) {
         // Pages 4..12 of the section at the placeholder's start.
         mem::VirtualFree(hole.cast(), 8 * K64, mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER);
         let view = mem::MapViewOfFile3(handle, process, hole.cast(), (4 * K64) as u64, 8 * K64, mem::MEM_REPLACE_PLACEHOLDER, mem::PAGE_READWRITE, std::ptr::null_mut(), 0);
-        if !view.Value.is_null() {
-            // Renderer port 1's way: the view opened by its address.
-            let memory = hole.add(K64);
-            fill(memory, 2 * K64, 9);
-            let opened = open(&rig.device, From::Part(hole as usize, 8 * K64));
-            p.lines.push(format!("a view of a committed section, by its address (OpenExistingHeapFromAddress1, renderer port 1): {}", hr(&opened)));
-            if let Ok(heap) = &opened {
-                let placed = place(&rig.device, heap, K64 as u64, 2 * K64 as u64);
-                if let Ok(buffer) = &placed {
-                    let before = rig.fetch(buffer, 0, 2 * K64).is_ok_and(|got| same(memory, &got));
-                    fill(memory, 2 * K64, 21);
-                    let after = rig.fetch(buffer, 0, 2 * K64).is_ok_and(|got| same(memory, &got));
-                    let new: Vec<u8> = (0..K64).map(|i| (i as u8) ^ 0x66).collect();
-                    p.view_writes = rig.store(buffer, 0, &new).is_ok() && same(memory, &new);
-                    p.view_reads = before && after;
-                    p.lines.push(format!(
-                        "  the GPU reads the bytes the CPU wrote before the opening {before}, and after it {after}; the CPU reads what the GPU wrote {}",
-                        p.view_writes
-                    ));
-                } else {
-                    p.lines.push(format!("  a buffer placed in it: {}", hr(&placed)));
-                }
-            }
-        }
         let opened = open(&rig.device, From::Section(handle as usize));
         p.lines.push(format!("a section made committed (OpenExistingHeapFromFileMapping): {}", hr(&opened)));
         let mut unmapped = false;
@@ -1553,27 +1458,6 @@ pub(crate) mod tests {
         assert!(probe.section_reads && probe.section_writes, "a committed section in place");
         assert!(probe.section_outlives_views, "the section's heap does not depend on views");
         assert!(probe.reserved_section_refused, "a reserved section is refused");
-    }
-
-    /// The probe on the default adapter, the card (`cargo test -- --ignored
-    /// card_probe --nocapture`): what this PC's driver makes of memory in
-    /// place, and renderer port 1's gate agreeing with it. Under Wine on AMD
-    /// (vkd3d-proton, RADV, 2026-11-26) a section's view opens and is other
-    /// memory to the card: the probe's view check is false both ways, and
-    /// port 1 must stay off ([`views_in_place`]).
-    #[test]
-    #[ignore = "wants a card"]
-    fn card_probe_and_the_port_gate_agree_on_section_views() {
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
-        let mut device: Option<ID3D12Device> = None;
-        // SAFETY: plain device creation on the default adapter.
-        unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }.expect("a device");
-        let device = device.expect("a device");
-        let probe = probe(&device, &|| None, 4);
-        for line in &probe.lines {
-            eprintln!("in place probe: {line}");
-        }
-        assert_eq!(views_in_place(&device), probe.view_reads && probe.view_writes, "the gate of renderer port 1");
     }
 
     /// Stage 1's own call on the software adapter: a title buffer that
