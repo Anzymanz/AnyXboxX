@@ -308,19 +308,20 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, slot count, contents) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    /// Tables made afresh in this list: (title heap, table or 0, slot count,
+    /// contents) → first dynamic slot.
+    fresh_tables: std::collections::HashMap<(usize, u64, u32, u64), u32>,
     /// (Neptune) Of those, the ones whose views were made ready for a draw
     /// (`readable`) with nothing to do again while the host list's count of state
-    /// changes stands: the host list, that count, and the textures the table shows.
+    /// changes stands: keyed by (table key, accessed entries/kinds hash) →
+    /// (host list, state-change count, textures the draw reads).
     /// A draw that only tests its depth target and reads it too is not among them.
-    ready_tables: std::collections::HashMap<(u64, u32, u64), (usize, u64, Vec<usize>)>,
-    /// (Neptune) The tables (address, slot count, contents) this list has seen, with tables
-    /// told apart by their contents alone (`tables_by_content`): one at a new address whose
-    /// contents another had takes that one's host slots, and only its own title slots'
-    /// notes are made here.
-    seen_tables: std::collections::HashSet<(u64, u32, u64)>,
+    ready_tables: std::collections::HashMap<((usize, u64, u32, u64), u64), (usize, u64, Vec<usize>)>,
+    /// (Neptune) The tables (title heap, address, slot count, contents) this list
+    /// has seen, with tables told apart by their contents alone (`tables_by_content`):
+    /// one at a new address whose contents another had takes that one's host slots,
+    /// and only its own title slots' notes are made here.
+    seen_tables: std::collections::HashSet<(usize, u64, u32, u64)>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -2869,8 +2870,9 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
-            // The table and what its entries hold (record words).
-            let key = {
+            // The bound heap, the table, and what its entries hold (record words).
+            let heap_id = std::ptr::from_ref(heap) as usize;
+            let content_hash = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 for k in 0..n {
@@ -2878,13 +2880,14 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
-                // (Neptune) By contents alone (`tables_by_content`): the title writes every
-                // draw's table at a place of its own, and two thirds of a frame's tables
-                // (9,600 of 15,200, 73,000 slots) were made afresh although others with the
-                // same views in the same order had been made in the same list.
-                (if tables_by_content() { 0 } else { table }, n, h.finish())
+                h.finish()
             };
-            let here = (table, n, key.2);
+            // (Neptune) By contents alone (`tables_by_content`): the title writes every
+            // draw's table at a place of its own, and two thirds of a frame's tables
+            // (9,600 of 15,200, 73,000 slots) were made afresh although others with the
+            // same views in the same order had been made in the same list.
+            let key = (heap_id, if tables_by_content() { 0 } else { table }, n, content_hash);
+            let here = (heap_id, table, n, content_hash);
             if let Some(&first) = self.fresh_tables.get(&key) {
                 if tables_by_content() && self.seen_tables.insert(here) {
                     // Another table's host slots; this one's own title slots are noted as
@@ -2908,6 +2911,25 @@ impl State {
                         }
                     }
                 }
+                // Which non-CBV entries and access kinds this draw actually reads or writes:
+                // another pipeline (or root-indexed selection) over the same table may touch
+                // entries that were never transitioned, refreshed, or marked for write-back.
+                let usage_hash = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                        u.table_offset_dwords.hash(&mut h);
+                        std::mem::discriminant(&u.kind).hash(&mut h);
+                    }
+                    0xffu8.hash(&mut h);
+                    for &k in &selected {
+                        if !entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
+                            k.hash(&mut h);
+                        }
+                    }
+                    h.finish()
+                };
+                let ready_key = (key, usage_hash);
                 // (Neptune) The same table again in the same host list, with no texture's
                 // state changed since its views were made ready: nothing to do. A fifth
                 // of the recording threads' working time went into doing it again for
@@ -2915,7 +2937,7 @@ impl State {
                 let here = std::ptr::from_ref(list) as usize;
                 let (tested, _) = TESTED_DEPTH.get();
                 let ready = ready_tables_on()
-                    && self.ready_tables.get(&key).is_some_and(|(at, changes, textures)| {
+                    && self.ready_tables.get(&ready_key).is_some_and(|(at, changes, textures)| {
                         *at == here
                             && *changes == list.changes.load(Ordering::Relaxed)
                             && (tested == 0 || !textures.contains(&tested))
@@ -2928,7 +2950,7 @@ impl State {
                 TABLES[1].fetch_add(1, Ordering::Relaxed);
                 // Why not: no note of it, another host list, the list's count moved, or
                 // the draw's tested depth target among its textures.
-                match self.ready_tables.get(&key) {
+                match self.ready_tables.get(&ready_key) {
                     None => TABLES[5].fetch_add(1, Ordering::Relaxed),
                     Some((at, _, _)) if *at != here => TABLES[6].fetch_add(1, Ordering::Relaxed),
                     Some((_, changes, _)) if *changes != list.changes.load(Ordering::Relaxed) => TABLES[7].fetch_add(1, Ordering::Relaxed),
@@ -2974,9 +2996,9 @@ impl State {
                     }
                 }
                 if plain && (tested == 0 || !textures.contains(&tested)) {
-                    self.ready_tables.insert(key, (here, list.changes.load(Ordering::Relaxed), textures));
+                    self.ready_tables.insert(ready_key, (here, list.changes.load(Ordering::Relaxed), textures));
                 } else {
-                    self.ready_tables.remove(&key);
+                    self.ready_tables.remove(&ready_key);
                 }
                 made.push((slot, first * 32));
                 continue;
@@ -4102,5 +4124,696 @@ mod route_tests {
         assert_eq!(route(true, false, false, false), Route::InPlace);
         assert_eq!(route(false, false, true, true), Route::Ahead);
         assert_eq!(route(false, false, true, false), Route::InPlace);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::{Iid, S_OK, guid, slot};
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::core::s;
+
+    const HEAP_IID: Iid = guid(
+        0x8efb471d,
+        0x616c,
+        0x4f49,
+        [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+    );
+    const RESOURCE_IID: Iid = guid(
+        0x696442be,
+        0xa72e,
+        0x4059,
+        [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+    );
+
+    #[repr(C)]
+    struct ExtendedHeapDesc {
+        kind: u32,
+        count: u32,
+        flags: u32,
+        nodes: u32,
+        address: u64,
+        size: u64,
+    }
+
+    #[repr(C)]
+    struct HeapProps {
+        kind: u32,
+        cpu: u32,
+        pool: u32,
+        creation: u32,
+        visible: u32,
+    }
+
+    #[repr(C)]
+    struct TitleResourceDesc {
+        dimension: u32,
+        alignment: u64,
+        width: u64,
+        height: u32,
+        depth_or_array_size: u16,
+        mip_levels: u16,
+        format: u32,
+        sample_count: u32,
+        sample_quality: u32,
+        layout: u32,
+        flags: u32,
+    }
+
+    fn release_obj(obj: This) {
+        slot::<extern "system" fn(This) -> u32>(obj, 0x10)(obj);
+    }
+
+    fn make_view_heap(count: u32) -> (This, u64) {
+        let desc = ExtendedHeapDesc {
+            kind: 0,
+            count,
+            flags: 1,
+            nodes: 1,
+            address: 0,
+            size: 0,
+        };
+        let mut h = std::ptr::null();
+        let hr = crate::descriptor::create_heap(
+            std::ptr::null(),
+            (&raw const desc).cast(),
+            &HEAP_IID,
+            &mut h,
+        );
+        assert_eq!(hr, S_OK);
+        let start = crate::descriptor::heap(h).start;
+        (h, start)
+    }
+
+    fn make_buffer(bytes: u64, flags: u32) -> (This, *mut u8) {
+        let props = HeapProps {
+            kind: 1,
+            cpu: 0,
+            pool: 0,
+            creation: 1,
+            visible: 1,
+        };
+        let desc = TitleResourceDesc {
+            dimension: 1,
+            alignment: 0,
+            width: bytes,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 0,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 1,
+            flags,
+        };
+        let mut r = std::ptr::null();
+        let hr = crate::resource::create_committed(
+            std::ptr::null(),
+            (&raw const props).cast(),
+            0,
+            (&raw const desc).cast(),
+            0,
+            std::ptr::null(),
+            &RESOURCE_IID,
+            &mut r,
+        );
+        assert_eq!(hr, S_OK);
+        let (ptr, len) = crate::resource::buffer_bytes(r).expect("buffer bytes");
+        assert!(len >= bytes);
+        (r, ptr)
+    }
+
+    fn make_rt_texture(width: u64, height: u32) -> This {
+        let props = HeapProps {
+            kind: 1,
+            cpu: 0,
+            pool: 0,
+            creation: 1,
+            visible: 1,
+        };
+        let desc = TitleResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width,
+            height,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28, // R8G8B8A8_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 1, // ALLOW_RENDER_TARGET
+        };
+        let mut r = std::ptr::null();
+        let hr = crate::resource::create_committed(
+            std::ptr::null(),
+            (&raw const props).cast(),
+            0,
+            (&raw const desc).cast(),
+            0x4, // RENDER_TARGET
+            std::ptr::null(),
+            &RESOURCE_IID,
+            &mut r,
+        );
+        assert_eq!(hr, S_OK);
+        r
+    }
+
+    fn raw_buffer_srv(resource: This, dwords: u32, handle: u64) {
+        // Format=R32_TYPELESS(39), ViewDimension=BUFFER(1), Mapping=5768, pad,
+        // FirstElement(lo,hi)=0, NumElements=dwords, Stride=0, Flags=RAW(1).
+        let desc = [39u32, 1, 5768, 0, 0, 0, dwords, 0, 1, 0];
+        crate::descriptor::create_srv(std::ptr::null(), resource, &desc, handle);
+    }
+
+    fn raw_buffer_uav(resource: This, dwords: u32, handle: u64) {
+        // Format=R32_TYPELESS(39), ViewDimension=BUFFER(1),
+        // FirstElement(lo,hi)=0, NumElements=dwords, Stride=0, CounterOffset(lo,hi)=0, Flags=RAW(1).
+        let desc = [39u32, 1, 0, 0, dwords, 0, 0, 0, 1, 0];
+        crate::descriptor::create_uav(std::ptr::null(), resource, std::ptr::null(), &desc, handle);
+    }
+
+    fn tex2d_srv(resource: This, handle: u64) {
+        // Format=R8G8B8A8_UNORM(28), ViewDimension=TEXTURE2D(4), Mapping=5768, pad,
+        // MostDetailedMip=0, MipLevels=1, PlaneSlice=0, MinLOD=0.
+        let desc = [28u32, 4, 5768, 0, 0, 1, 0, 0, 0, 0];
+        crate::descriptor::create_srv(std::ptr::null(), resource, &desc, handle);
+    }
+
+    fn cbv(addr: u64, size: u32, handle: u64) {
+        let desc = [addr as u32, (addr >> 32) as u32, size, 0];
+        crate::descriptor::create_cbv(std::ptr::null(), &desc, handle);
+    }
+
+    fn used_entry(slot: u8, table_offset_dwords: u32, kind: ResourceType) -> UsedResource {
+        UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot,
+        }
+    }
+
+    fn compile_cs(
+        device: &ID3D12Device,
+        source: &str,
+    ) -> (ID3D12RootSignature, ID3D12PipelineState) {
+        let mut code: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        // SAFETY: source and entry strings outlive D3DCompile.
+        unsafe {
+            if let Err(e) = D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                s!("draw_test"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            ) {
+                let msg = errors.map_or_else(String::new, |b| {
+                    String::from_utf8_lossy(std::slice::from_raw_parts(
+                        b.GetBufferPointer().cast::<u8>(),
+                        b.GetBufferSize(),
+                    ))
+                    .into_owned()
+                });
+                panic!("D3DCompile failed: {e}: {msg}");
+            }
+            let code = code.unwrap();
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        }
+    }
+
+    fn readback_u32(device: &ID3D12Device) -> (ID3D12Resource, *mut u32) {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buf: Option<ID3D12Resource> = None;
+        let mut ptr = std::ptr::null_mut();
+        // SAFETY: valid buffer creation and persistent map.
+        unsafe {
+            device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buf,
+                )
+                .unwrap();
+            let buf = buf.unwrap();
+            buf.Map(0, None, Some(&mut ptr)).unwrap();
+            ptr.cast::<u32>().write_volatile(0);
+            (buf, ptr.cast())
+        }
+    }
+
+    #[test]
+    fn ready_tables_transitions_texture_newly_read_from_cached_table() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let (heap_obj, heap_start) = make_view_heap(64);
+        let (cb_res, cb_ptr) = make_buffer(256, 0);
+        let tex_a = make_rt_texture(4, 4);
+        let tex_b = make_rt_texture(4, 4);
+
+        // Slot 0: CBV, Slot 1: tex_a SRV, Slot 2: tex_b SRV.
+        cbv(cb_ptr as u64, 256, heap_start);
+        tex2d_srv(tex_a, heap_start + 32);
+        tex2d_srv(tex_b, heap_start + 64);
+
+        let list = host.new_list().unwrap();
+        let host_tex_a = crate::resource::host_resource(tex_a).unwrap();
+        // Clear tex_a to bright green, leaving it tracked in RENDER_TARGET (0x4).
+        let rtv = host.rtv(Some(host_tex_a), None);
+        crate::list::ensure_state(&list, tex_a, 0x4);
+        // SAFETY: open list, fresh RTV of live RT texture.
+        unsafe {
+            list.list.ClearRenderTargetView(rtv, &[0.0, 1.0, 0.0, 1.0], None);
+        }
+
+        let mut state = State::default();
+        state.set_heaps(&[heap_obj]);
+        state.set_table(false, 0, heap_start);
+
+        // Pipeline 1 reads slot 0 (CBV) and slot 2 (tex_b), NOT slot 1 (tex_a).
+        let used_p1 = [
+            used_entry(0, 0, ResourceType::Cbv),
+            used_entry(0, 16, ResourceType::Srv),
+        ];
+        // First call creates the dynamic table; second call populates ready_tables.
+        let _ = state.tables(&list, &used_p1, &[], false);
+        let _ = state.tables(&list, &used_p1, &[], false);
+
+        // Pipeline 2 uses the SAME 3-slot table, now ALSO reading slot 1 (tex_a).
+        let used_p2 = [
+            used_entry(0, 0, ResourceType::Cbv),
+            used_entry(0, 8, ResourceType::Srv),
+            used_entry(0, 16, ResourceType::Srv),
+        ];
+        let made = state.tables(&list, &used_p2, &[], false);
+        let first = made[0].1 / 32;
+
+        // Sample tex_a from dynamic slot (first + 1) on the GPU and write RGBA8 to readback.
+        const SAMPLE_CS: &str = r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u0)"
+Texture2D<float4> src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    float4 c = src.Load(int3(0, 0, 0));
+    uint r = (uint)(c.r * 255.0 + 0.5);
+    uint g = (uint)(c.g * 255.0 + 0.5);
+    uint b = (uint)(c.b * 255.0 + 0.5);
+    uint a = (uint)(c.a * 255.0 + 0.5);
+    dst.Store(0, r | (g << 8) | (b << 16) | (a << 24));
+}
+"#;
+        let (root, pso) = compile_cs(&host.device, SAMPLE_CS);
+        let (out_buf, out_ptr) = readback_u32(&host.device);
+        let host_heap = crate::descriptor::heap(heap_obj).host().unwrap();
+        // SAFETY: open list, live heap/PSO/buffers.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list
+                .SetComputeRootDescriptorTable(0, host_heap.gpu_handle(first + 1));
+            list.list
+                .SetComputeRootUnorderedAccessView(1, out_buf.GetGPUVirtualAddress());
+            list.list.Dispatch(1, 1, 1);
+        }
+        // Verify tex_a was transitioned out of RENDER_TARGET (0x4) to SHADER_RESOURCE (0xc0).
+        let after_state = list.transition(tex_a, SHADER_RESOURCE);
+        assert!(
+            after_state.is_none(),
+            "tex_a should already be in SHADER_RESOURCE after Pipeline 2 bound it, but was left in {:#x}",
+            after_state.unwrap().1
+        );
+
+        list.close();
+        host.execute(&[&list]);
+        if let Some(err) = host.log_messages() {
+            panic!("D3D12 debug error: {err}");
+        }
+        // SAFETY: GPU finished executing `list`.
+        let pixel = unsafe { out_ptr.read_volatile() };
+        assert_eq!(pixel, 0xff00_ff00, "expected cleared green texel (0,255,0,255)");
+
+        drop(state);
+        drop(list);
+        release_obj(tex_a);
+        release_obj(tex_b);
+        release_obj(cb_res);
+        release_obj(heap_obj);
+    }
+
+    #[test]
+    fn ready_tables_tracks_uav_writes_for_newly_used_slot() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let (heap_obj, heap_start) = make_view_heap(64);
+        let (cb_res, cb_ptr) = make_buffer(256, 0);
+        let (buf_a, ptr_a) = make_buffer(256, 4); // ALLOW_UNORDERED_ACCESS
+        let (buf_b, ptr_b) = make_buffer(256, 0);
+        // SAFETY: buffers are 256 bytes each.
+        unsafe {
+            ptr_a.cast::<u32>().write(0);
+            ptr_b.cast::<u32>().write(0x1122_3344);
+        }
+
+        // Slot 0: CBV, Slot 1: buf_a raw UAV, Slot 2: buf_b raw SRV.
+        cbv(cb_ptr as u64, 256, heap_start);
+        raw_buffer_uav(buf_a, 64, heap_start + 32);
+        raw_buffer_srv(buf_b, 64, heap_start + 64);
+
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap_obj]);
+        state.set_table(true, 0, heap_start);
+
+        // Pipeline 1 reads slot 0 (CBV) and slot 2 (buf_b SRV), NOT slot 1 (buf_a UAV).
+        let used_p1 = [
+            used_entry(0, 0, ResourceType::Cbv),
+            used_entry(0, 16, ResourceType::Srv),
+        ];
+        let _ = state.tables(&list, &used_p1, &[], true);
+        let _ = state.tables(&list, &used_p1, &[], true);
+
+        // Pipeline 2 uses the SAME table, now writing slot 1 (buf_a UAV).
+        let used_p2 = [
+            used_entry(0, 0, ResourceType::Cbv),
+            used_entry(0, 8, ResourceType::Uav),
+            used_entry(0, 16, ResourceType::Srv),
+        ];
+        let made = state.tables(&list, &used_p2, &[], true);
+        let first = made[0].1 / 32;
+
+        const WRITE_CS: &str = r#"
+#define RS "DescriptorTable(UAV(u0)), DescriptorTable(SRV(t0))"
+RWByteAddressBuffer dst : register(u0);
+ByteAddressBuffer src : register(t0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    dst.Store(0, src.Load(0) ^ 0x55555555u);
+}
+"#;
+        let (root, pso) = compile_cs(&host.device, WRITE_CS);
+        let host_heap = crate::descriptor::heap(heap_obj).host().unwrap();
+        // SAFETY: open list, live heap/PSO/buffers.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list
+                .SetComputeRootDescriptorTable(0, host_heap.gpu_handle(first + 1));
+            list.list
+                .SetComputeRootDescriptorTable(1, host_heap.gpu_handle(first + 2));
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        if let Some(err) = host.log_messages() {
+            panic!("D3D12 debug error: {err}");
+        }
+        // SAFETY: GPU finished and copy-back wrote into title memory.
+        let landed = unsafe { ptr_a.cast::<u32>().read_volatile() };
+        assert_eq!(
+            landed,
+            0x1122_3344 ^ 0x5555_5555,
+            "UAV write to newly used slot must be copied back to title memory"
+        );
+
+        drop(state);
+        drop(list);
+        release_obj(buf_a);
+        release_obj(buf_b);
+        release_obj(cb_res);
+        release_obj(heap_obj);
+    }
+
+    #[test]
+    fn ready_tables_refreshes_buffer_when_root_indexed_selection_changes() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let (heap_obj, heap_start) = make_view_heap(64);
+        let (cb_res, cb_ptr) = make_buffer(256, 0);
+        let (buf_a, ptr_a) = make_buffer(256, 0);
+        let (buf_b, ptr_b) = make_buffer(256, 0);
+        // SAFETY: buffers are 256 bytes each.
+        unsafe {
+            ptr_a.cast::<u32>().write(0xDEAD_BEEF);
+            ptr_b.cast::<u32>().write(0x1122_3344);
+        }
+
+        // Slot 0: CBV, Slot 1: buf_a raw SRV, Slot 2: buf_b raw SRV.
+        cbv(cb_ptr as u64, 256, heap_start);
+        raw_buffer_srv(buf_a, 64, heap_start + 32);
+        raw_buffer_srv(buf_b, 64, heap_start + 64);
+
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap_obj]);
+        state.set_table(true, 0, heap_start);
+
+        let used = [
+            used_entry(0, 0, ResourceType::Cbv),
+            used_entry(0, 16, ResourceType::Srv),
+        ];
+        let indexed = [RootIndexedView {
+            table_slot: 0,
+            constant_slot: 1,
+            constant_dword: 0,
+            byte_offset: 0,
+            shift: 5,
+        }];
+
+        // Draws 1 & 2 select slot 2 (buf_b), caching the table in ready_tables.
+        state.set_constants(true, 1, &[2], 0);
+        let _ = state.tables(&list, &used, &indexed, true);
+        let _ = state.tables(&list, &used, &indexed, true);
+
+        // Draw 3 changes the root constant to select slot 1 (buf_a).
+        state.set_constants(true, 1, &[1], 0);
+        let made = state.tables(&list, &used, &indexed, true);
+        let first = made[0].1 / 32;
+
+        const READ_CS: &str = r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u0)"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    dst.Store(0, src.Load(0));
+}
+"#;
+        let (root, pso) = compile_cs(&host.device, READ_CS);
+        let (out_buf, out_ptr) = readback_u32(&host.device);
+        let host_heap = crate::descriptor::heap(heap_obj).host().unwrap();
+        // SAFETY: open list, live heap/PSO/buffers.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list
+                .SetComputeRootDescriptorTable(0, host_heap.gpu_handle(first + 1));
+            list.list
+                .SetComputeRootUnorderedAccessView(1, out_buf.GetGPUVirtualAddress());
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        if let Some(err) = host.log_messages() {
+            panic!("D3D12 debug error: {err}");
+        }
+        // SAFETY: GPU finished executing `list`.
+        let value = unsafe { out_ptr.read_volatile() };
+        assert_eq!(
+            value, 0xDEAD_BEEF,
+            "newly selected buffer via RootIndexedView must be refreshed before GPU read"
+        );
+
+        drop(state);
+        drop(list);
+        release_obj(buf_a);
+        release_obj(buf_b);
+        release_obj(cb_res);
+        release_obj(heap_obj);
+    }
+
+    #[test]
+    fn fresh_tables_do_not_collide_across_descriptor_heaps() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let (heap_a, start_a) = make_view_heap(64);
+        let (heap_b, start_b) = make_view_heap(64);
+        let (cb_res, cb_ptr) = make_buffer(256, 0);
+        let (buf_a, ptr_a) = make_buffer(256, 0);
+        // SAFETY: buffer is 256 bytes.
+        unsafe {
+            ptr_a.cast::<u32>().write(0xCAFE_BABE);
+        }
+
+        // Write identical [CBV, buf_a raw SRV] descriptors into both heaps.
+        for start in [start_a, start_b] {
+            cbv(cb_ptr as u64, 256, start);
+            raw_buffer_srv(buf_a, 64, start + 32);
+        }
+
+        let used = [
+            used_entry(0, 0, ResourceType::Cbv),
+            used_entry(0, 8, ResourceType::Srv),
+        ];
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+
+        // First draw binds heap_a.
+        state.set_heaps(&[heap_a]);
+        state.set_table(true, 0, start_a);
+        let _ = state.tables(&list, &used, &[], true);
+
+        // Second draw switches to heap_b with identical table contents.
+        state.set_heaps(&[heap_b]);
+        state.set_table(true, 0, start_b);
+        let made_b = state.tables(&list, &used, &[], true);
+        let first_b = made_b[0].1 / 32;
+
+        const READ_CS: &str = r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u0)"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    dst.Store(0, src.Load(0));
+}
+"#;
+        let (root, pso) = compile_cs(&host.device, READ_CS);
+        let (out_buf, out_ptr) = readback_u32(&host.device);
+        let host_heap_b = crate::descriptor::heap(heap_b).host().unwrap();
+        // SAFETY: open list, live heap/PSO/buffers.
+        unsafe {
+            list.list
+                .SetDescriptorHeaps(&[Some(host_heap_b.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list
+                .SetComputeRootDescriptorTable(0, host_heap_b.gpu_handle(first_b + 1));
+            list.list
+                .SetComputeRootUnorderedAccessView(1, out_buf.GetGPUVirtualAddress());
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        if let Some(err) = host.log_messages() {
+            panic!("D3D12 debug error: {err}");
+        }
+        // SAFETY: GPU finished executing `list`.
+        let value = unsafe { out_ptr.read_volatile() };
+        assert_eq!(
+            value, 0xCAFE_BABE,
+            "switching descriptor heaps must populate dynamic slots in the bound heap"
+        );
+
+        drop(state);
+        drop(list);
+        release_obj(buf_a);
+        release_obj(cb_res);
+        release_obj(heap_a);
+        release_obj(heap_b);
+    }
+
+    #[test]
+    fn ready_tables_reuses_entry_when_heap_and_usage_match() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let (heap_obj, heap_start) = make_view_heap(64);
+        let (cb_res, cb_ptr) = make_buffer(256, 0);
+        let (buf_a, ptr_a) = make_buffer(256, 0);
+        // SAFETY: buffer is 256 bytes.
+        unsafe { ptr_a.cast::<u32>().write(0x1234_5678) };
+        cbv(cb_ptr as u64, 256, heap_start);
+        raw_buffer_srv(buf_a, 64, heap_start + 32);
+
+        let used = [
+            used_entry(0, 0, ResourceType::Cbv),
+            used_entry(0, 8, ResourceType::Srv),
+        ];
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap_obj]);
+        state.set_table(false, 0, heap_start);
+
+        let m1 = state.tables(&list, &used, &[], false);
+        let m2 = state.tables(&list, &used, &[], false);
+        assert_eq!(m1, m2);
+        let hits_before = TABLES[0].load(Ordering::Relaxed);
+        let m3 = state.tables(&list, &used, &[], false);
+        assert_eq!(m2, m3);
+        assert!(
+            TABLES[0].load(Ordering::Relaxed) > hits_before,
+            "identical heap, table, and usage must still hit ready_tables"
+        );
+
+        list.close();
+        drop(state);
+        drop(list);
+        release_obj(buf_a);
+        release_obj(cb_res);
+        release_obj(heap_obj);
     }
 }
