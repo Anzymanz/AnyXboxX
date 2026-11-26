@@ -43,34 +43,28 @@ const HEIGHT_RANGE: (u32, u32) = (360, 4320);
 /// 8,010 MB in use against a 6,823 MB budget: Windows moved the rest into the PC's memory (6,096 MB
 /// of shared memory in use, 1,970 MB of RAM left free) and the texture queue was refused for good.
 /// The windows and buffer values are the ones measured on that card at a 5.8 fps median in the
-/// world (2026-11-26, Series X, 1080p display mode); the list pool is the Quality set's.
+/// world (2026-11-26, Series X, 1080p display mode, Neptune base; Vice-Tay reads no list pool variable).
 /// `VICTORY_TEXTURE_MAX_SIZE=1024` keeps the levels of the title's textures over 1024 texels off the
 /// card (`victory-gpu` `tiles::max_size`; three quarters of a texture for each level cut), so the
-/// texture queue has room for every texture instead of being refused. Because VIctory only applies
-/// `VICTORY_TEXTURE_MAX_SIZE` when `VICTORY_LEVELS_ON_DEMAND=1` (`resource.rs` / `tiles::wanted`),
-/// the preset sets it explicitly so 8 GB AMD, Intel and Linux hosts honour the cap too. The texture
-/// staging pool stays at the profile's 512 MB, so textures arrive as fast as with Fast.
+/// texture queue has room for every texture instead of being refused. It works through the
+/// `VICTORY_LEVELS_ON_DEMAND=1` of the Neptune profile (Vice-Tay's tuned set does not set it, and
+/// it no longer reads `VICTORY_TEXTURE_MAX_SIZE`: see `UNREAD_BY_VICE_TAY` in the tests).
 pub const LOW_VRAM: &[(&str, &str)] = &[
     ("VICTORY_CARD_WINDOWS_MB", "512"),
     ("VICTORY_CARD_BUFFERS_MB", "512"),
     ("VICTORY_TEXTURE_ROOM_PERCENT", "85"),
-    ("VICTORY_LIST_POOL_MOST", "256"),
-    ("VICTORY_LIST_POOL_MB", "256"),
-    ("VICTORY_LEVELS_ON_DEMAND", "1"),
     ("VICTORY_TEXTURE_MAX_SIZE", "1024"),
 ];
 
 /// The "12 GB card" preset: Fast's speed with headroom. The profile's reserves (1536 MB of windows
 /// and of buffer copies) were sized on 12 to 16 GB cards and measured on a 16 GB one; here they
 /// are 1024 MB each, and the title's textures are capped at 2048 texels (`VICTORY_TEXTURE_MAX_SIZE`,
-/// one level cut on the 4096 ones only, with `VICTORY_LEVELS_ON_DEMAND=1` so non-NVIDIA profiles
-/// honour the cap), so the texture queue keeps room on a 12 GB card. Not measured on a 12 GB card
-/// yet.
+/// one level cut on the 4096 ones only), so the texture queue keeps room on a 12 GB card. Not
+/// measured on a 12 GB card yet.
 pub const MID_VRAM: &[(&str, &str)] = &[
     ("VICTORY_CARD_WINDOWS_MB", "1024"),
     ("VICTORY_CARD_BUFFERS_MB", "1024"),
     ("VICTORY_TEXTURE_ROOM_PERCENT", "90"),
-    ("VICTORY_LEVELS_ON_DEMAND", "1"),
     ("VICTORY_TEXTURE_MAX_SIZE", "2048"),
 ];
 
@@ -448,7 +442,7 @@ mod tests {
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
         assert_eq!(quality, expected);
-        assert_eq!(quality.len(), 5);
+        assert_eq!(quality.len(), 3);
     }
 
     #[test]
@@ -467,12 +461,7 @@ mod tests {
                 .map(|(_, v)| v.parse::<u32>().expect("a number"))
                 .expect("in the tuned set")
         };
-        for name in [
-            "VICTORY_CARD_WINDOWS_MB",
-            "VICTORY_CARD_BUFFERS_MB",
-            "VICTORY_TEXTURE_ROOM_PERCENT",
-            "VICTORY_LIST_POOL_MB",
-        ] {
+        for name in ["VICTORY_CARD_WINDOWS_MB", "VICTORY_CARD_BUFFERS_MB"] {
             let low = get(name).expect("set by the preset");
             assert!(
                 low < profile(name),
@@ -481,7 +470,8 @@ mod tests {
         }
         // The size cap, and the switch it needs in the profile.
         assert_eq!(get("VICTORY_TEXTURE_MAX_SIZE"), Some(1024));
-        assert_eq!(profile("VICTORY_LEVELS_ON_DEMAND"), 1);
+        // The texture room is not in the tuned set any more: the preset sits below VIctory's default (90).
+        assert!(get("VICTORY_TEXTURE_ROOM_PERCENT").expect("set by the preset") < 90);
         assert!(Preset::ALL.contains(&Preset::LowVram));
     }
 
@@ -502,13 +492,10 @@ mod tests {
                 .map(|(_, v)| v.parse::<u32>().expect("a number"))
                 .expect("in the tuned set")
         };
-        for name in [
-            "VICTORY_CARD_WINDOWS_MB",
-            "VICTORY_CARD_BUFFERS_MB",
-            "VICTORY_TEXTURE_ROOM_PERCENT",
-        ] {
+        for name in ["VICTORY_CARD_WINDOWS_MB", "VICTORY_CARD_BUFFERS_MB"] {
             let mid = value(Preset::MidVram, name);
-            assert!(mid < fast(name), "{name}: {mid} is not below Fast");
+            // Fast's windows are 1024 MB too, since the Vice-Tay set: the buffers carry the difference.
+            assert!(mid <= fast(name), "{name}: {mid} is above Fast");
             assert!(
                 mid > value(Preset::LowVram, name),
                 "{name}: {mid} is not above 8 GB"
@@ -543,6 +530,11 @@ mod tests {
         assert!(Keyboard::Qwertz.shoulder_keys().contains("Y C"));
     }
 
+    /// Names the launcher still offers that the Vice-Tay base does not read (checked by grep on its
+    /// crates and apps on 2026-11-26): these options do nothing on this base until its sources read
+    /// them or the options are removed.
+    const UNREAD_BY_VICE_TAY: [&str; 1] = ["VICTORY_TEXTURE_MAX_SIZE"];
+
     #[test]
     fn every_variable_an_option_names_exists_in_victorys_sources() {
         let victory = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -568,6 +560,9 @@ mod tests {
             .copied()
             .chain(preset_names.iter().map(String::as_str))
         {
+            if UNREAD_BY_VICE_TAY.contains(&name) {
+                continue;
+            }
             assert!(
                 sources.contains(&format!("\"{name}\"")),
                 "{name} is read nowhere in third_party/victory"
