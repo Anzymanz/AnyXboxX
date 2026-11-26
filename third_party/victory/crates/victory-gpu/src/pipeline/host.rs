@@ -237,13 +237,16 @@ impl GraphicsState {
             .map(|e| {
                 let slot = e.InputSlot.min(31) as usize;
                 let format = e.Format.0 as u32;
+                let bytes = crate::resource::element(format).map_or(0, |(b, _)| b as u32);
                 let offset = if e.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT {
-                    next[slot]
+                    // The input assembler aligns elements on 1-, 2- or
+                    // 4-byte boundaries according to their format size.
+                    let alignment = bytes.clamp(1, 4).next_power_of_two();
+                    next[slot].checked_next_multiple_of(alignment).unwrap_or(u32::MAX)
                 } else {
                     e.AlignedByteOffset
                 };
-                let bytes = crate::resource::element(format).map_or(0, |(b, _)| b as u32);
-                next[slot] = offset + bytes;
+                next[slot] = offset.saturating_add(bytes);
                 Input {
                     slot: slot as u32,
                     offset,
@@ -983,6 +986,10 @@ fn root_signature(
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
     }
 }
+
+#[cfg(test)]
+#[path = "rectangle_input_tests.rs"]
+mod rectangle_input_tests;
 
 #[cfg(test)]
 mod tests {
