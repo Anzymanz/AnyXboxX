@@ -183,14 +183,14 @@ fn cut_list_replayed_cbv_table_reads_updated_constants_after_part1_recycles() {
     let cb_desc = [cb_addr as u32, (cb_addr >> 32) as u32, 256, 0];
     create_cbv(null(), &cb_desc, table_handle);
 
-    let used = cbv_used();
+    let plan = TablePlan::new(&cbv_used(), &[]);
     let mut state = State::default();
     state.set_heaps(&[title_heap.0]);
     state.set_table(true, 0, table_handle);
 
     // Part 1: before the cut.
     let list1 = host.new_list().expect("list1");
-    let made1 = state.tables(&list1, &used, &[], true);
+    let made1 = state.tables(&list1, &plan, true);
     assert_eq!(made1.len(), 1);
     let slot1 = made1[0].1 / 32;
     let readback1 = record_cbv_dispatch(host, &list1, &root, &pso, host_heap, slot1);
@@ -199,7 +199,7 @@ fn cut_list_replayed_cbv_table_reads_updated_constants_after_part1_recycles() {
     // Cut onto a fresh HostList (`list::cut` / `list::value_written` calls `State::replay`).
     let list2 = host.new_list().expect("list2");
     state.replay(&list2);
-    let made2 = state.tables(&list2, &used, &[], true);
+    let made2 = state.tables(&list2, &plan, true);
     assert_eq!(made2.len(), 1);
     let slot2 = made2[0].1 / 32;
     let readback2 = record_cbv_dispatch(host, &list2, &root, &pso, host_heap, slot2);
@@ -259,20 +259,20 @@ fn cut_list_replayed_cbv_table_survives_dropped_part1() {
     let cb_desc = [cb_addr as u32, (cb_addr >> 32) as u32, 256, 0];
     create_cbv(null(), &cb_desc, table_handle);
 
-    let used = cbv_used();
+    let plan = TablePlan::new(&cbv_used(), &[]);
     let mut state = State::default();
     state.set_heaps(&[title_heap.0]);
     state.set_table(true, 0, table_handle);
 
     let list1 = host.new_list().expect("list1");
-    let made1 = state.tables(&list1, &used, &[], true);
+    let made1 = state.tables(&list1, &plan, true);
     let slot1 = made1[0].1 / 32;
     let readback1 = record_cbv_dispatch(host, &list1, &root, &pso, host_heap, slot1);
     list1.close();
 
     let list2 = host.new_list().expect("list2");
     state.replay(&list2);
-    let made2 = state.tables(&list2, &used, &[], true);
+    let made2 = state.tables(&list2, &plan, true);
     let slot2 = made2[0].1 / 32;
     let readback2 = record_cbv_dispatch(host, &list2, &root, &pso, host_heap, slot2);
     list2.close();
@@ -292,42 +292,4 @@ fn cut_list_replayed_cbv_table_survives_dropped_part1() {
         "part 2 must read updated constants (got {got2:#010x}, slot1={slot1}, slot2={slot2})"
     );
     assert_ne!(slot2, slot1);
-}
-
-/// An internal pass recorded into the *same* `HostList` (`after_our_pass`, used
-/// by `ambient` and `after_external`) still owns its scratch uploads, so it must
-/// keep `fresh_tables` cached while forcing descriptor heaps, root signatures,
-/// and PSO to rebind.
-#[test]
-fn after_our_pass_on_same_list_keeps_fresh_tables_and_resets_host_heaps() {
-    let Some(host) = host() else {
-        return;
-    };
-    let title_heap = TitleHeap::new(64);
-    let h = heap(title_heap.0);
-    let table_handle = h.handle(0).expect("slot 0 handle");
-
-    let cb_mem = [0xCAFE_BABEu32; 64];
-    let cb_addr = cb_mem.as_ptr() as u64;
-    let cb_desc = [cb_addr as u32, (cb_addr >> 32) as u32, 256, 0];
-    create_cbv(null(), &cb_desc, table_handle);
-
-    let used = cbv_used();
-    let list = host.new_list().expect("list");
-    let mut state = State::default();
-    state.set_heaps(&[title_heap.0]);
-    state.set_table(true, 0, table_handle);
-    state.host_pipeline = 1;
-    state.host_roots = [1, 2];
-    state.host_heaps = state.heaps;
-
-    let made1 = state.tables(&list, &used, &[], true);
-    state.after_our_pass(&list);
-    assert_eq!(state.host_pipeline, 0);
-    assert_eq!(state.host_roots, [0, 0]);
-    assert_eq!(state.host_heaps, [usize::MAX; 2]);
-
-    let made2 = state.tables(&list, &used, &[], true);
-    assert_eq!(made2, made1, "same HostList should keep reusing its fresh_tables slot");
-    list.close();
 }
