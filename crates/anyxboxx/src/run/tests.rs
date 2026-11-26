@@ -66,13 +66,14 @@ fn the_tuned_set_is_neptune_s_measured_set() {
 
 #[test]
 fn quality_is_applied_after_the_tuned_set_and_before_overrides() {
-    let env = settings::base(&parse(&[
+    let env = environment(&parse(&[
         "--game-dir",
         "G",
         "--quality",
         "--override",
         "VICTORY_RELAY=0",
-    ]));
+    ]))
+    .unwrap();
     assert_eq!(
         value(&env, "VICTORY_CARD_WINDOWS_MB"),
         Some(OsString::from("0"))

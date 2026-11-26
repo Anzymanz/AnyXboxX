@@ -105,7 +105,7 @@ fn pairs(
         .map(|(k, v)| ((*k).to_string(), OsString::from(*v)))
 }
 
-/// Variables set before the XG library is checked, in the script's order.
+/// Profile settings and switches. Explicit overrides are applied after XG validation.
 pub fn base(args: &RunArgs) -> Vec<(String, OsString)> {
     let mut env = vec![(GAME_DIR.to_string(), args.game_dir.clone().into_os_string())];
     env.extend(pairs(ALWAYS));
@@ -118,9 +118,6 @@ pub fn base(args: &RunArgs) -> Vec<(String, OsString)> {
     }
     if args.quality {
         env.extend(pairs(QUALITY));
-    }
-    for (name, value) in &args.overrides {
-        env.push((name.clone(), OsString::from(value)));
     }
     if args.auto_a {
         env.push((AUTO_A.to_string(), OsString::from("150")));

@@ -132,7 +132,7 @@ def binary():
 
 
 def launch(tmp_path, fake_tool, binary, options=(), *, cargo_exit=0, game_exe=True, precompile_inputs=False,
-           archives=("A.rpf", "b.rpf")):
+           archives=("A.rpf", "b.rpf"), inherited=()):
     """Runs `anyxboxx run` in a fake repository; returns (process, calls with <root> for tmp_path)."""
     manifest = tmp_path / "depot" / "third_party" / "victory" / "Cargo.toml"
     manifest.parent.mkdir(parents=True)
@@ -156,6 +156,7 @@ def launch(tmp_path, fake_tool, binary, options=(), *, cargo_exit=0, game_exe=Tr
     shutil.copy(fake_tool, tmp_path / "prebuilt" / "prebuilt.exe")
     log = tmp_path / "calls.log"
     env = {k: v for k, v in os.environ.items() if not k.startswith("VICTORY_")}
+    env.update(inherited)
     env.update({"PATH": f"{tmp_path / 'tools'}{os.pathsep}{os.environ['PATH']}",
                 "CARGO_TARGET_DIR": str(tmp_path / "target"), "FAKE_TOOL_LOG": str(log),
                 "FAKE_TOOL_EXIT_CARGO": str(cargo_exit), "FAKE_TOOL_EXIT_VICTORY_RUN": str(VICTORY_EXIT),
@@ -199,6 +200,20 @@ def test_override_wins_over_quality_and_the_tuned_set(tmp_path, fake_tool, binar
     assert "VICTORY_RELAY=0" in logged and "VICTORY_RELAY=2" not in logged, done.stderr
 
 
+def test_overrides_apply_to_warm_and_run_after_all_switches(tmp_path, fake_tool, binary):
+    options = ["--warm", "--no-tuned-settings", "--auto-a", "--frametime-dump", "--xg-dll", "{xg}",
+               "--override", "VICTORY_AUTO_A=30", "--override", "VICTORY_FRAMETIME_DUMP=",
+               "--override", "VICTORY_XG_MODE=compare", "--override", "VICTORY_D3D12_DRED="]
+    inherited = (("VICTORY_D3D12_DRED", "1"), ("VICTORY_FRAMETIME_DUMP", "parent"))
+    done, calls = launch(tmp_path, fake_tool, binary, options, inherited=inherited)
+    expected = (GAME_DIR, "VICTORY_DISCORD=0", "VICTORY_OCEAN_READBACK=1", "VICTORY_AUTO_A=30",
+                r"VICTORY_XG_DLL=<root>\xg_xs.dll", "VICTORY_XG_MODE=compare")
+    env = ";".join(sorted(expected))
+    assert calls == [BUILD + "VICTORY_D3D12_DRED=1;VICTORY_FRAMETIME_DUMP=parent",
+                     WARM_ARCHIVES + env, GAME + env], done.stderr
+    assert done.returncode == VICTORY_EXIT
+
+
 def test_auto_a_and_frametime_dump_are_set_when_asked(tmp_path, fake_tool, binary):
     done, calls = launch(tmp_path, fake_tool, binary, ["--auto-a", "--frametime-dump"])
     logged = calls[1].split(" | ", 1)[1].split(";")
@@ -218,6 +233,12 @@ def test_diag_builds_the_diagnostics_profile(tmp_path, fake_tool, binary):
     assert calls[0] == BUILD_DIAG, done.stderr
 
 
+def test_skip_pipelines_keeps_the_release_build(tmp_path, fake_tool, binary):
+    done, calls = launch(tmp_path, fake_tool, binary, ["--skip-pipelines", "0123456789abcdef"])
+    assert calls == [BUILD, GAME + default_env(("VICTORY_SKIP_PIPELINES=0123456789abcdef",))], done.stderr
+    assert done.returncode == VICTORY_EXIT
+
+
 def test_the_users_xg_library_is_passed_with_its_mode(tmp_path, fake_tool, binary):
     done, calls = launch(tmp_path, fake_tool, binary, ["--no-tuned-settings", "--xg-dll", "{xg}", "--xg-mode", "compare"])
     expected = (GAME_DIR, "VICTORY_DISCORD=0", "VICTORY_OCEAN_READBACK=1",
@@ -225,10 +246,16 @@ def test_the_users_xg_library_is_passed_with_its_mode(tmp_path, fake_tool, binar
     assert calls == [BUILD, GAME + ";".join(sorted(expected))], done.stderr
 
 
-def test_a_missing_xg_library_stops_after_the_build(tmp_path, fake_tool, binary):
+def test_a_missing_xg_library_stops_before_the_build(tmp_path, fake_tool, binary):
     done, calls = launch(tmp_path, fake_tool, binary, ["--xg-dll", "missing.dll"])
-    assert calls == [BUILD] and done.returncode == 1
+    assert calls == [] and done.returncode == 1
     assert "xg_xs.dll not found" in done.stderr
+
+
+def test_invalid_override_stops_before_building(tmp_path, fake_tool, binary):
+    done, calls = launch(tmp_path, fake_tool, binary, ["--override", "PATH=x"])
+    assert calls == [] and done.returncode != 0
+    assert "--override takes VICTORY_* names only" in done.stderr
 
 
 def test_warm_runs_the_game_archives_only_before_the_game(tmp_path, fake_tool, binary):
