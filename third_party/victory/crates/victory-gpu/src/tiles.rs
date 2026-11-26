@@ -120,55 +120,6 @@ pub(crate) fn floor() -> u64 {
     *BYTES.get_or_init(|| parse_floor(std::env::var("VICTORY_LEVELS_MIN_KB").ok().as_deref()))
 }
 
-/// The texture size cap, `VICTORY_TEXTURE_MAX_SIZE=<texels>` (256 at the
-/// least; unset: none). With it, a texture the title fills whose level 0 is
-/// wider or taller than the cap is made level by level like the textures
-/// above (`resource.rs` `hosted`), and its levels above the cap are never
-/// held (`texture.rs` `held_levels`): they get no tiles, and its views start
-/// at the first level within the cap ([`show_from`]). The picture is that
-/// level's, sharp to the cap; the card's memory of the levels above it, three
-/// quarters of such a texture for each level cut, is not taken. For cards
-/// whose memory cannot hold the title's textures at full size.
-pub(crate) fn max_size() -> Option<u32> {
-    static CAP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        let cap = parse_max_size(std::env::var("VICTORY_TEXTURE_MAX_SIZE").ok().as_deref());
-        if let Some(cap) = cap {
-            tracing::info!(
-                cap,
-                levels_on_demand = wanted(),
-                "texture levels above the size cap are not held (VICTORY_TEXTURE_MAX_SIZE)"
-            );
-        }
-        cap
-    })
-}
-
-fn parse_max_size(value: Option<&str>) -> Option<u32> {
-    value
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|&cap| cap > 0)
-        .map(|cap| cap.max(256))
-}
-
-/// The first level of a `width` x `height` texture of `levels` levels that
-/// fits within `cap` on both sides (0 when level 0 does; the last level at
-/// most).
-pub(crate) fn first_within(width: u64, height: u64, levels: u32, cap: u32) -> u32 {
-    let cap = u64::from(cap);
-    let mut level = 0;
-    while level + 1 < levels && ((width >> level).max(1) > cap || (height >> level).max(1) > cap) {
-        level += 1;
-    }
-    level
-}
-
-/// Whether a texture of `width` x `height` texels has a level 0 over the
-/// size cap.
-pub(crate) fn over_cap(width: u64, height: u64) -> bool {
-    max_size().is_some_and(|cap| width > u64::from(cap) || height > u64::from(cap))
-}
-
 /// The bytes of the tiles given to textures now: the card's memory they
 /// hold (`resource.rs` `room` counts it with the other host copies).
 pub(crate) fn given_total() -> u64 {
@@ -697,13 +648,13 @@ impl Drop for Tiled {
 /// Keeps a two-dimensional shader view (2D or 2D array) from the levels
 /// before `first` of a texture of `levels` levels: it starts at `first` if
 /// it started before it, shows as many levels fewer (clamped to the
-/// remaining levels), and reduces `ResourceMinLODClamp` by the same shift so
-/// the effective minimum LOD stays at the same resource level.
+/// remaining levels). `ResourceMinLODClamp` is measured from mip 0 of the
+/// resource, so moving the start of the view preserves that field.
 pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32) {
     if first >= levels {
         return;
     }
-    let clamp = |most: &mut u32, mips: &mut u32, min_lod: &mut f32| {
+    let clamp = |most: &mut u32, mips: &mut u32| {
         if first <= *most {
             return;
         }
@@ -712,20 +663,17 @@ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, 
         if *mips != u32::MAX {
             *mips = mips.saturating_sub(fewer).clamp(1, levels - first);
         }
-        if *min_lod > 0.0 {
-            *min_lod = (*min_lod - fewer as f32).max(0.0);
-        }
     };
     match desc.ViewDimension {
         D3D12_SRV_DIMENSION_TEXTURE2D => {
             // SAFETY: `ViewDimension` selects `Texture2D`.
             let view = unsafe { &mut desc.Anonymous.Texture2D };
-            clamp(&mut view.MostDetailedMip, &mut view.MipLevels, &mut view.ResourceMinLODClamp);
+            clamp(&mut view.MostDetailedMip, &mut view.MipLevels);
         }
         D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
             // SAFETY: `ViewDimension` selects `Texture2DArray`.
             let view = unsafe { &mut desc.Anonymous.Texture2DArray };
-            clamp(&mut view.MostDetailedMip, &mut view.MipLevels, &mut view.ResourceMinLODClamp);
+            clamp(&mut view.MostDetailedMip, &mut view.MipLevels);
         }
         _ => {}
     }
@@ -1313,10 +1261,10 @@ void look() {
         give_back(singles[1].1, &singles[1].2);
     }
 
-    /// (v) A view made by [`show_from`] of a texture whose level 0 has no
-    /// tiles returns level 1's colour for a sample at level 0; the view as
-    /// the title asked returns zero.
-    fn the_view_starts_at_the_first_level_with_tiles(rig: &mut Rig) -> Option<()> {
+    /// (v) Sample LOD 0 through the adjusted and original views. Level 0
+    /// has no tiles. A minimum LOD inside the resident range should select
+    /// the same resource level through either view.
+    fn sample_resident_views(rig: &mut Rig, min_lod: f32) -> Option<[u32; 2]> {
         rig.step = "step 5, the view from the first level with tiles";
         let cs = compile(LOOK, s!("look"), s!("cs_5_1")).ok()?;
         let format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1362,7 +1310,7 @@ void look() {
                         MostDetailedMip: 0,
                         MipLevels: u32::MAX,
                         PlaneSlice: 0,
-                        ResourceMinLODClamp: 0.0,
+                        ResourceMinLODClamp: min_lod,
                     },
                 },
             };
@@ -1404,14 +1352,12 @@ void look() {
             let mut data = std::ptr::null_mut();
             let range = D3D12_RANGE { Begin: 0, End: 16 };
             back.Map(0, Some(&range), Some(&mut data)).unwrap();
-            let read = std::slice::from_raw_parts(data.cast::<u32>(), 2).to_vec();
+            let read = data.cast::<[u32; 2]>().read();
             back.Unmap(0, None);
             read
         };
-        eprintln!("a sample at level 0: {} through the view from level 1, {} through the view as asked", read[0], read[1]);
-        assert_eq!(read[0], 32, "the view from the first level with tiles reads level 1");
-        assert_eq!(read[1], 0, "the view from level 0 reads a level without tiles");
-        Some(())
+        eprintln!("sample at LOD 0, minimum {min_lod}: adjusted and original {read:?}");
+        Some(read)
     }
 
     fn a_full_card_keeps_new_levels_waiting(rig: &mut Rig) {
@@ -1500,8 +1446,12 @@ void look() {
         a_level_on_several_ranges(&mut rig);
         a_full_card_keeps_new_levels_waiting(&mut rig);
         a_claim_given_up_is_made_again(&mut rig);
-        if the_view_starts_at_the_first_level_with_tiles(&mut rig).is_none() {
-            eprintln!("the view test's shader or objects could not be made; that part was skipped");
+        for (min_lod, expected) in [(0.0, [32, 0]), (3.0, [64, 64])] {
+            let Some(read) = sample_resident_views(&mut rig, min_lod) else {
+                eprintln!("the view test's shader or objects could not be made; that part was skipped");
+                break;
+            };
+            assert_eq!(read, expected, "resource minimum LOD {min_lod}");
         }
         rig.step = "the end";
         rig.check("every step done");
@@ -1530,29 +1480,7 @@ void look() {
     }
 
     #[test]
-    fn the_size_cap_finds_the_first_level_within_it() {
-        // 4096x4096 with 13 levels, cap 1024: levels 0 (4096) and 1 (2048) are cut.
-        assert_eq!(first_within(4096, 4096, 13, 1024), 2);
-        // Within the cap already: nothing is cut.
-        assert_eq!(first_within(1024, 1024, 11, 1024), 0);
-        assert_eq!(first_within(512, 256, 10, 1024), 0);
-        // One side over is enough: 4096x512 needs two halvings.
-        assert_eq!(first_within(4096, 512, 13, 1024), 2);
-        // Never past the last level.
-        assert_eq!(first_within(8192, 8192, 2, 256), 1);
-    }
-
-    #[test]
-    fn the_size_cap_is_read_with_a_floor_of_256() {
-        assert_eq!(parse_max_size(None), None);
-        assert_eq!(parse_max_size(Some("0")), None);
-        assert_eq!(parse_max_size(Some("nope")), None);
-        assert_eq!(parse_max_size(Some(" 1024 ")), Some(1024));
-        assert_eq!(parse_max_size(Some("64")), Some(256));
-    }
-
-    #[test]
-    fn show_from_clamps_2d_and_2d_array_and_adjusts_min_lod() {
+    fn show_from_preserves_resource_min_lod_for_2d_and_2d_array() {
         let mut srv2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -1572,7 +1500,7 @@ void look() {
         assert_eq!(v2d.MostDetailedMip, 3);
         // Clamped to remaining levels (11 - 3 = 8), not 12 - 3 = 9.
         assert_eq!(v2d.MipLevels, 8);
-        assert_eq!(v2d.ResourceMinLODClamp, 0.5);
+        assert_eq!(v2d.ResourceMinLODClamp, 3.5);
 
         let mut srv_arr = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -1594,7 +1522,7 @@ void look() {
         let varr = unsafe { srv_arr.Anonymous.Texture2DArray };
         assert_eq!(varr.MostDetailedMip, 2);
         assert_eq!(varr.MipLevels, 4);
-        assert_eq!(varr.ResourceMinLODClamp, 0.0);
+        assert_eq!(varr.ResourceMinLODClamp, 1.5);
     }
 
     #[test]
