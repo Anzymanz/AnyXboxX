@@ -368,8 +368,8 @@ def instruction(rng, names):
 # for the Python model (which indexes SGPRs and register pairs directly).
 # Operations whose constant is a literal: the VOP3 form has no literal word unless a source is the literal code.
 LITERAL_OPERATION_NAMES = ("v_madmk_f32", "v_madak_f32", "v_fmamk_f32", "v_fmaak_f32")
-# The 64-bit operations; v_fma_f64 is left to its own test, where its operands cannot overflow the Python.
-WIDE_GENERIC = tuple(name for name in WIDE_OPERATIONS if name != "v_fma_f64")
+# The 64-bit operations (including v_fma_f64 now that overflow returns ±infinity in both models).
+WIDE_GENERIC = tuple(WIDE_OPERATIONS)
 DIV_NAMES = (
     "v_div_scale_f32", "v_div_scale_f64", "v_div_fmas_f32", "v_div_fmas_f64", "v_div_fixup_f32", "v_div_fixup_f64",
 )
@@ -530,6 +530,29 @@ def test_wide_operations_match_the_python_model():
         for index in range(8):
             value = rng.choice(CURATED_DOUBLE_BITS) if rng.random() < 0.7 else rng.getrandbits(64)
             scalars += [(index, value & 0xFFFF_FFFF), (index + 8, value >> 32)]
+        assert_same(exe, 32, False, scalars, program(low, high))
+
+
+def test_fma_f64_overflow_and_signed_zero_match_the_python_model():
+    """v_fma_f64 overflow (±infinity), product-overflow cancellation, and ±0.0 signs match Rust f64::mul_add."""
+    exe = binary()
+    opcode = OPCODES["VOP3", "v_fma_f64"]
+    low = 0x35 << 26 | opcode << 16
+    high = 0 | 2 << 9 | 4 << 18
+    cases = [
+        (0x7FEF_FFFF_FFFF_FFFF, 0x4000_0000_0000_0000, 0x0000_0000_0000_0000),  # +MAX * 2 + 0 -> +inf
+        (0xFFEF_FFFF_FFFF_FFFF, 0x4000_0000_0000_0000, 0x0000_0000_0000_0000),  # -MAX * 2 + 0 -> -inf
+        (0x7FEF_FFFF_FFFF_FFFF, 0x4000_0000_0000_0000, 0xFFEF_FFFF_FFFF_FFFF),  # +MAX * 2 - MAX -> +MAX
+        (0x8000_0000_0000_0000, 0x3FF0_0000_0000_0000, 0x8000_0000_0000_0000),  # -0 * 1 + -0 -> -0
+        (0x8000_0000_0000_0000, 0x3FF0_0000_0000_0000, 0x0000_0000_0000_0000),  # -0 * 1 + +0 -> +0
+        (0xBFF0_0000_0000_0000, 0x3FF0_0000_0000_0000, 0x3FF0_0000_0000_0000),  # -1 * 1 + 1 -> +0
+    ]
+    for a, b, c in cases:
+        scalars = [
+            (0, a & 0xFFFF_FFFF), (1, a >> 32),
+            (2, b & 0xFFFF_FFFF), (3, b >> 32),
+            (4, c & 0xFFFF_FFFF), (5, c >> 32),
+        ]
         assert_same(exe, 32, False, scalars, program(low, high))
 
 
