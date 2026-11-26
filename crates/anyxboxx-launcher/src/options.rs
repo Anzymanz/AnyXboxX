@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 use crate::env::Pair;
 
 pub const DISPLAY_MODE: &str = "VICTORY_DISPLAY_MODE";
+/// The size the title renders its output at (Vice-Tay base): `VICTORY_DISPLAY_MODE` only changes
+/// what DXGI reports, the title keeps the size its own settings hold (4K as a Series X wrote them).
+pub const OUTPUT: &str = "VICTORY_OUTPUT";
+/// The sizes the title has a display mode for: `VICTORY_OUTPUT` takes only these.
+pub const TITLE_MODES: [(u32, u32); 5] = [(1280, 720), (1664, 936), (1920, 1080), (2560, 1440), (3840, 2160)];
 pub const WINDOW_MODE: &str = "VICTORY_WINDOW_MODE";
 pub const KEYBOARD: &str = "VICTORY_KEYBOARD";
 pub const LOG: &str = "VICTORY_LOG";
@@ -23,8 +28,9 @@ pub const FRAMETIME_DUMP: &str = "VICTORY_FRAMETIME_DUMP";
 /// Every variable an option may set (the preset's own are in `Preset::overrides`); the tests
 /// check them against VIctory's sources.
 #[cfg(test)]
-pub const ENV_NAMES: [&str; 7] = [
+pub const ENV_NAMES: [&str; 8] = [
     DISPLAY_MODE,
+    OUTPUT,
     WINDOW_MODE,
     KEYBOARD,
     LOG,
@@ -342,6 +348,9 @@ impl LaunchOptions {
         let mut pairs = self.preset.overrides();
         if let Some((w, h)) = self.size() {
             pairs.push((DISPLAY_MODE.to_string(), format!("{w}x{h}")));
+            if TITLE_MODES.contains(&(w, h)) {
+                pairs.push((OUTPUT.to_string(), format!("{w}x{h}")));
+            }
         }
         if self.window == WindowMode::Borderless {
             pairs.push((WINDOW_MODE.to_string(), "borderless".to_string()));
@@ -405,6 +414,7 @@ mod tests {
                 .map(|(_, v)| v.as_str())
         };
         assert_eq!(get(DISPLAY_MODE), Some("2560x1440"));
+        assert_eq!(get(OUTPUT), Some("2560x1440"));
         assert_eq!(get(WINDOW_MODE), Some("borderless"));
         assert_eq!(get(KEYBOARD), Some("azerty"));
         assert_eq!(get(LOG), Some("debug"));
@@ -585,4 +595,19 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn the_output_size_is_set_only_for_the_titles_own_modes() {
+        let output = |resolution| {
+            LaunchOptions { resolution, ..LaunchOptions::default() }
+                .env_pairs()
+                .into_iter()
+                .find(|(k, _)| k == OUTPUT)
+                .map(|(_, v)| v)
+        };
+        assert_eq!(output(Resolution::P1080).as_deref(), Some("1920x1080"));
+        assert_eq!(output(Resolution::P720).as_deref(), Some("1280x720"));
+        assert_eq!(output(Resolution::P900), None);
+        assert_eq!(output(Resolution::Default), None);
+    }
+
 }
