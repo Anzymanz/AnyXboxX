@@ -9,6 +9,8 @@
 //! title sets it.
 
 #[cfg(test)]
+mod cut_tables_tests;
+#[cfg(test)]
 mod heap_texture_tests;
 mod root_slots;
 
@@ -904,9 +906,13 @@ impl State {
     /// The pipeline, the root signatures and the heaps are set by the next
     /// draw or dispatch (`bind`, which is told here that the host list has
     /// none); root arguments, vertex and index buffers are set by every
-    /// draw anyway. The dynamic descriptor slots and the tables made in
-    /// them stay: the parts before the cut have not run yet, and they are
-    /// given back when the title's list is reset.
+    /// draw anyway. Dynamic descriptor slots already allocated stay in
+    /// `dynamic` until the title's last part finishes, while the per-host-list
+    /// table caches (`fresh_tables`, `ready_tables`, `seen_tables`) and
+    /// indirect window are cleared: CBV descriptors in `fresh_tables` point
+    /// into the earlier `HostList`'s scratch upload memory, which may be
+    /// recycled or dropped once that earlier part completes (before this part
+    /// runs).
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
@@ -914,6 +920,10 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.fresh_tables.clear();
+        self.ready_tables.clear();
+        self.seen_tables.clear();
+        self.window = None;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -2558,7 +2568,7 @@ impl State {
         crate::capture::dump_after(list, self.pipeline as This, &[]);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if self.ambient(list, p) {
-            self.replay(list);
+            self.after_our_pass(list);
         }
     }
 
