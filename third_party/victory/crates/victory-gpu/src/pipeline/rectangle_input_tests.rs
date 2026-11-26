@@ -81,9 +81,6 @@ fn appended_rectangle_corner_reaches_the_vertex_shader() {
     let expected = [0.75f32.to_bits(), 1.0f32.to_bits(), u32::from(TAG)];
 
     if let Some(host) = host() {
-        let adapter = crate::host::adapter_summary()
-            .expect("identified test adapter")
-            .0;
         let (vertices, mapped) = host.upload_buffer(STRIDE as u64).unwrap();
         let written = host.uav_buffer(12).unwrap();
         let readback = host.read_back_buffer(12).unwrap();
@@ -186,7 +183,7 @@ fn appended_rectangle_corner_reaches_the_vertex_shader() {
         };
         drop((pipeline, root));
         println!(
-            "adapter={adapter}, expanded offset={}, shader readback={got:08x?}, expected={expected:08x?}",
+            "expanded offset={}, shader readback={got:08x?}, expected={expected:08x?}",
             elements[1].0
         );
         assert_eq!(got, expected, "native vertex fetch of the expanded corner");
