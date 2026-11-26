@@ -3628,6 +3628,10 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 #[cfg(test)]
+#[path = "alpha_view_tests.rs"]
+mod alpha_view_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

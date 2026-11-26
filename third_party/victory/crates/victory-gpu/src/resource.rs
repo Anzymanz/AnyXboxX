@@ -653,7 +653,7 @@ pub(crate) fn family(format: u32) -> u32 {
         (44, 47),
         (48, 52),
         (53, 59),
-        (60, 65),
+        (60, 64), // R8; A8_UNORM (65) has no typeless family.
         (70, 72),
         (73, 75),
         (76, 78),
@@ -3343,6 +3343,16 @@ mod tests {
 
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn alpha_format_stands_outside_the_red_typeless_family() {
+        assert_eq!(family(65), 65); // A8_UNORM
+        for format in 60..=64 {
+            assert_eq!(family(format), 60); // R8_TYPELESS and its typed variants
+        }
+        assert_eq!(family(59), 53);
+        assert_eq!(family(66), 66);
+    }
 
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;
