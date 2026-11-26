@@ -533,7 +533,7 @@ mod tests {
     /// Names the launcher still offers that the Vice-Tay base does not read (checked by grep on its
     /// crates and apps on 2026-11-26): these options do nothing on this base until its sources read
     /// them or the options are removed.
-    const UNREAD_BY_VICE_TAY: [&str; 2] = ["VICTORY_FRAMETIME_DUMP", "VICTORY_TEXTURE_MAX_SIZE"];
+    const UNREAD_BY_VICE_TAY: [&str; 1] = ["VICTORY_TEXTURE_MAX_SIZE"];
 
     #[test]
     fn every_variable_an_option_names_exists_in_victorys_sources() {
