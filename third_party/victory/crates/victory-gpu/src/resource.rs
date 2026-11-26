@@ -1791,7 +1791,7 @@ pub(crate) fn copy_state(this: This) -> Option<(u8, u64, u64)> {
     let memory = r.data() as u64;
     let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
     Some(match made.as_ref() {
-        Some((host, _)) => (2, host.bytes, memory),
+        Some((host, _)) => (2, host.card_bytes(), memory),
         None => (u8::from(r.host.gone.load(Relaxed)), footprint(&r.desc).map_or(0, |f| f.size), memory),
     })
 }
@@ -1846,10 +1846,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
             }
             let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             match made.as_ref() {
-                Some((host, _)) => copies.push(match &host.tiled {
-                    Some(tiled) => (r.data() as usize, r.desc, tiled.given_bytes(), true),
-                    None => (r.data() as usize, r.desc, host.bytes, false),
-                }),
+                Some((host, _)) => copies.push((r.data() as usize, r.desc, host.card_bytes(), host.tiled.is_some())),
                 None => without[usize::from(r.host.gone.load(Relaxed))] += 1,
             }
         }
@@ -2045,8 +2042,16 @@ fn oldest_covering(mut copies: Vec<(usize, u64, u64)>, need: u64) -> Vec<usize> 
 /// their title texture.
 #[cfg(windows)]
 fn pressure_victims(video: Option<[u64; 4]>) -> Vec<usize> {
+    match evict_percent() {
+        Some(percent) => pressure_victims_at(video, percent, crate::host::moment()),
+        None => Vec::new(),
+    }
+}
+
+#[cfg(windows)]
+fn pressure_victims_at(video: Option<[u64; 4]>, percent: u64, now: u64) -> Vec<usize> {
     use std::sync::atomic::Ordering::Relaxed;
-    let (Some(percent), Some([budget, used, ..])) = (evict_percent(), video) else {
+    let Some([budget, used, ..]) = video else {
         return Vec::new();
     };
     let need = excess(budget, used, percent);
@@ -2058,17 +2063,22 @@ fn pressure_victims(video: Option<[u64; 4]>) -> Vec<usize> {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
-        if !fills(&r.desc) {
+        if !fills(&r.desc) || crate::texture::host_wrote(at) {
             continue;
         }
         let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((host, _)) = made.as_ref() {
+            let bytes = host.card_bytes();
             let stamp = r.host.used.load(Relaxed);
-            if crate::host::long_ago(stamp, PRESSED_MS, PRESSED_FRAMES)
+            let frames = (now >> 32).saturating_sub(stamp >> 32);
+            let tenths = (now & 0xffff_ffff).saturating_sub(stamp & 0xffff_ffff);
+            if bytes > 0
+                && frames >= PRESSED_FRAMES
+                && tenths * 100 >= PRESSED_MS
                 && std::sync::Arc::strong_count(host) == 1
                 && crate::host::references(&host.texture) == 1
             {
-                copies.push((at, stamp, host.bytes));
+                copies.push((at, stamp, bytes));
             }
         }
     }
@@ -2099,16 +2109,17 @@ fn account(idle_ms: u64) {
         } else {
             4
         };
-        v[kind] += host.bytes;
+        let bytes = host.card_bytes();
+        v[kind] += bytes;
         if let Some(t) = twin {
             v[5] += t.colour.bytes + t.plane.as_ref().map_or(0, |p| p.bytes);
         }
         if kind < 2 {
-            filled_at.push((r.data() as usize, host.bytes));
+            filled_at.push((r.data() as usize, bytes));
             if crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, 4)
                 && (std::sync::Arc::strong_count(host) > 1 || crate::host::references(&host.texture) > 1)
             {
-                v[6] += host.bytes;
+                v[6] += bytes;
             }
         }
     }
@@ -2201,15 +2212,16 @@ fn let_go_idle_with(video: Option<[u64; 4]>, slot_settings: Option<(u64, u64)>) 
                 }
             };
             if let Some((host, _)) = gone {
+                let freed = host.card_bytes();
                 r.host.gone.store(true, Relaxed);
                 KINDS[2].fetch_add(1, Relaxed);
-                KINDS[3].fetch_add(host.bytes, Relaxed);
+                KINDS[3].fetch_add(freed, Relaxed);
                 if pressed.binary_search(&at).is_ok() {
                     EVICTED[0].fetch_add(1, Relaxed);
-                    EVICTED[1].fetch_add(host.bytes, Relaxed);
+                    EVICTED[1].fetch_add(freed, Relaxed);
                 }
                 went += 1;
-                bytes += host.bytes;
+                bytes += freed;
                 if first.is_none() {
                     first = Some(at);
                 }
@@ -2309,9 +2321,13 @@ fn slot_evict_with(
             }
             let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((host, _)) = made.as_ref() {
+                let bytes = host.card_bytes();
                 let stamp = r.host.used.load(Relaxed);
-                if crate::host::long_ago(stamp, idle_ms, frames) && std::sync::Arc::strong_count(host) == 1 {
-                    copies.push((at, stamp, host.bytes));
+                if bytes > 0
+                    && crate::host::long_ago(stamp, idle_ms, frames)
+                    && std::sync::Arc::strong_count(host) == 1
+                {
+                    copies.push((at, stamp, bytes));
                     raws.insert(windows::core::Interface::as_raw(&host.texture) as usize, at);
                 }
             }
@@ -2369,12 +2385,13 @@ fn slot_evict_with(
         };
         match outcome {
             EvictOutcome::Gone(host) => {
+                let freed = host.card_bytes();
                 KINDS[2].fetch_add(1, Relaxed);
-                KINDS[3].fetch_add(host.bytes, Relaxed);
+                KINDS[3].fetch_add(freed, Relaxed);
                 SLOT_EVICT[0].fetch_add(1, Relaxed);
-                SLOT_EVICT[1].fetch_add(host.bytes, Relaxed);
+                SLOT_EVICT[1].fetch_add(freed, Relaxed);
                 n += 1;
-                bytes += host.bytes;
+                bytes += freed;
                 crate::host::retire(host);
             }
             EvictOutcome::Busy => {
@@ -2418,7 +2435,7 @@ pub(crate) fn targets_census() -> [u64; 12] {
         if host.filled && !copied_into {
             continue;
         }
-        let bytes = host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes);
+        let bytes = host.card_bytes() + twin.as_ref().map_or(0, |t| t.colour.bytes);
         let mut add = |i: usize| {
             c[i] += 1;
             c[i + 1] += bytes;
@@ -2474,9 +2491,10 @@ pub(crate) fn census() -> [u64; 10] {
         let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
         match made.as_ref() {
             Some((host, twin)) => {
+                let own = host.card_bytes();
                 let kind = if host.filled { 4 } else { 0 };
                 count[kind] += 1;
-                count[kind + 1] += host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes);
+                count[kind + 1] += own + twin.as_ref().map_or(0, |t| t.colour.bytes);
                 count[7] += twin.as_ref().map_or(0, |t| t.colour.bytes);
                 let placed = r.host.placed.load(std::sync::atomic::Ordering::Relaxed);
                 if placed {
@@ -2487,9 +2505,9 @@ pub(crate) fn census() -> [u64; 10] {
                     // Its first page: a texture's smallest mips lie there,
                     // and are mapped first and unmapped last.
                     if placed_filled.is_multiple_of(EVERY) && !crate::texture::committed(r.data().cast_const(), 1) {
-                        count[8] += host.bytes * EVERY;
+                        count[8] += own * EVERY;
                         if crate::host::references(&host.texture) > 1 {
-                            count[9] += host.bytes * EVERY;
+                            count[9] += own * EVERY;
                         }
                     }
                 }
@@ -2552,6 +2570,15 @@ impl HostTexture {
             bytes: 0,
             filled: false,
             tiled: Some(tiled),
+        }
+    }
+
+    /// The card memory held by this host copy: its own committed bytes, or
+    /// the tiles currently mapped to a levels-on-demand texture (`crate::tiles`).
+    pub(crate) fn card_bytes(&self) -> u64 {
+        match &self.tiled {
+            Some(tiled) => tiled.given_bytes(),
+            None => self.bytes,
         }
     }
 }
@@ -4731,5 +4758,319 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tiled_textures_account_vram_and_bound_pressure_eviction() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        if let Some((name, vram)) = crate::host::adapter_summary() {
+            eprintln!("adapter: {name} ({} MiB VRAM)", vram >> 20);
+        }
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: plain feature query on the host device.
+        let tier_ok = unsafe {
+            host.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .is_ok()
+                && options.TiledResourcesTier.0 >= 2
+        };
+        if !tier_ok {
+            eprintln!("skipped: adapter tiled resources tier < 2");
+            return;
+        }
+
+        struct ReleaseAll(Vec<This>);
+        impl Drop for ReleaseAll {
+            fn drop(&mut self) {
+                for &r in &self.0 {
+                    slot::<Release>(r, 0x10)(r);
+                }
+            }
+        }
+
+        // Synthetic `now` at frame 8, t = 2.0 s (20 tenths) so stamps 0..8 at frame 0
+        // are all strictly older than PRESSED_MS (1000 ms) and PRESSED_FRAMES (2),
+        // without touching global frame-pacing state.
+        let now = (8u64 << 32) | 20;
+
+        // Build 6 synthetic levels-on-demand 1024x1024 RGBA8 mip-chained textures
+        // plus 1 unbacked reserved texture (0 tiles) and 1 host-written tiled texture.
+        let mut backing = vec![0u8; 64 * 1024];
+        let base_addr = backing.as_mut_ptr() as u64;
+        let desc = ResourceDesc {
+            dimension: 3, // TEXTURE2D
+            alignment: 0,
+            width: 1024,
+            height: 1024,
+            depth_or_array_size: 1,
+            mip_levels: 11,
+            format: 28, // R8G8B8A8_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        };
+
+        let make_tiled = |addr: u64, stamp: u64, map_levels: u32| -> (This, u64) {
+            let mut raw = std::ptr::null();
+            assert_eq!(
+                create_at_address(
+                    std::ptr::null(),
+                    addr,
+                    &desc,
+                    0,
+                    std::ptr::null(),
+                    &RESOURCE_IIDS[0],
+                    &mut raw,
+                ),
+                S_OK
+            );
+            let tex = host_texture_as(&desc, 0, std::ptr::null(), true)
+                .expect("reserved tiled texture on tier-2 device");
+            let tiled = crate::tiles::Tiled::make(&host.device, &tex, 11)
+                .expect("card reports tiling for 1024x1024x11");
+            if map_levels != 0 {
+                let (_, waiting) = tiled.uploaded_on(host.queue(), &host.device, &tex, map_levels, true);
+                assert!(!waiting, "tiles should map when room is true");
+            }
+            let bytes = tiled.given_bytes();
+            let mut ht = HostTexture::new_tiled(tex, 0, tiled);
+            ht.filled = true;
+            let r = resource(raw);
+            r.host.placed.store(true, Relaxed);
+            *r.host.made.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((std::sync::Arc::new(ht), None));
+            r.host.used.store(stamp, Relaxed);
+            (raw, bytes)
+        };
+
+        let mut owned = ReleaseAll(Vec::new());
+        // Oldest: a host-written tiled texture (must NOT be chosen as a pressure victim).
+        let (host_written_tex, hw_bytes) = make_tiled(base_addr, 0, (1u32 << 11) - 1);
+        owned.0.push(host_written_tex);
+        crate::texture::host_written(host_written_tex);
+        assert!(hw_bytes >= 4 << 20);
+
+        // Next oldest: a reserved tiled texture with 0 tiles mapped (frees 0 VRAM bytes).
+        let (empty_tex, empty_bytes) = make_tiled(base_addr + 0x100, 1, 0);
+        owned.0.push(empty_tex);
+        assert_eq!(empty_bytes, 0);
+
+        // 6 backed levels-on-demand textures with strictly increasing timestamps 2..=7.
+        let mut backed = Vec::new();
+        let mut per_tex_bytes = 0u64;
+        for i in 0..6u64 {
+            let (t, b) = make_tiled(base_addr + 0x200 + i * 0x100, 2 + i, (1u32 << 11) - 1);
+            owned.0.push(t);
+            backed.push(t as usize);
+            per_tex_bytes = b;
+        }
+        eprintln!("per tiled 1024x1024 RGBA8 texture: {} KiB ({} MiB)", per_tex_bytes >> 10, per_tex_bytes >> 20);
+
+        // Upload distinct patterns into mip 0 of each backed tiled texture on the GPU so we
+        // can verify surviving textures still read back intact after evicting only the victims.
+        let mut mip0_footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut mip0_rows = 0u32;
+        let mut mip0_total = 0u64;
+        // SAFETY: live device and texture description.
+        unsafe {
+            let d = resource(backed[0] as This)
+                .host
+                .made
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .unwrap()
+                .0
+                .texture
+                .GetDesc();
+            host.device.GetCopyableFootprints(
+                &d,
+                0,
+                1,
+                0,
+                Some(&mut mip0_footprint),
+                Some(&mut mip0_rows),
+                None,
+                Some(&mut mip0_total),
+            );
+        }
+        let upload_mip0 = |res: This, fill: u8| {
+            let (up_buf, up_ptr) = host.upload_buffer(mip0_total).expect("upload buffer");
+            // SAFETY: mapped upload buffer of `mip0_total` bytes.
+            unsafe { std::ptr::write_bytes(up_ptr, fill, mip0_total as usize) };
+            let list = host.new_list().expect("command list");
+            let tex = resource(res)
+                .host
+                .made
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .unwrap()
+                .0
+                .clone();
+            // SAFETY: open command list and live resources.
+            unsafe {
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&tex.texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&up_buf),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: mip0_footprint },
+                };
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &tex.texture,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &tex.texture,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+            list.close();
+            host.execute(&[&list]);
+        };
+        let readback_mip0_head = |res: This| -> [u8; 16] {
+            let rb = host.read_back_buffer(mip0_total).expect("readback buffer");
+            let list = host.new_list().expect("command list");
+            let tex = resource(res)
+                .host
+                .made
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .unwrap()
+                .0
+                .clone();
+            // SAFETY: open command list and live resources.
+            unsafe {
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&rb),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: mip0_footprint },
+                };
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&tex.texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &tex.texture,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &tex.texture,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut ptr = std::ptr::null_mut();
+            let mut out = [0u8; 16];
+            // SAFETY: completed readback buffer of `mip0_total` bytes.
+            unsafe {
+                rb.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }), Some(&mut ptr)).unwrap();
+                std::ptr::copy_nonoverlapping(ptr.cast::<u8>(), out.as_mut_ptr(), 16);
+                rb.Unmap(0, None);
+            }
+            out
+        };
+        for (i, &t) in backed.iter().enumerate() {
+            upload_mip0(t as This, 0x11u8.wrapping_mul(i as u8 + 1));
+        }
+
+        // 1. copy_state must report the mapped tile bytes, not 0.
+        let (state, reported, _) = copy_state(backed[0] as This).expect("copy_state");
+
+        // 2. account() must include tiled textures in VRAM_KINDS[1] (filled placed).
+        account(10_000);
+        let filled_placed = VRAM_KINDS[1].load(Relaxed);
+
+        // 3. Pressure eviction needing 1.5x one texture must pick ONLY the 2 oldest backed
+        //    evictable tiled textures (not all 6, not the 0-tile one, not the host-written one).
+        let budget = 100 * per_tex_bytes;
+        let used = 80 * per_tex_bytes + per_tex_bytes + per_tex_bytes / 2;
+        let victims = pressure_victims_at(Some([budget, used, 0, 0]), 80, now);
+        let our_victims: Vec<usize> = victims
+            .iter()
+            .copied()
+            .filter(|v| {
+                *v == host_written_tex as usize
+                    || *v == empty_tex as usize
+                    || backed.contains(v)
+            })
+            .collect();
+        let victim_backed = our_victims.iter().filter(|v| backed.contains(v)).count();
+        eprintln!(
+            "metrics: copy_state={reported} (expected {per_tex_bytes}), VRAM_KINDS[1]={filled_placed} (expected >= {}), \
+             pressure_victims_total={} (backed={victim_backed}, includes_host_written={}, includes_empty={})",
+            per_tex_bytes * 6 + hw_bytes,
+            our_victims.len(),
+            our_victims.contains(&(host_written_tex as usize)),
+            our_victims.contains(&(empty_tex as usize)),
+        );
+        assert_eq!(state, 2);
+        assert_eq!(reported, per_tex_bytes, "copy_state should report tiled VRAM bytes");
+        assert!(
+            filled_placed >= per_tex_bytes * 6 + hw_bytes,
+            "VRAM_KINDS[1] ({filled_placed}) should include tiled textures (>= {})",
+            per_tex_bytes * 6 + hw_bytes
+        );
+        assert!(
+            !our_victims.contains(&(host_written_tex as usize)),
+            "host-written texture must not be selected as a pressure victim"
+        );
+        assert!(
+            !our_victims.contains(&(empty_tex as usize)),
+            "0-tile reserved texture must not be selected as a pressure victim"
+        );
+        let mut expected = vec![backed[0], backed[1]];
+        expected.sort_unstable();
+        assert_eq!(
+            our_victims, expected,
+            "pressure_victims over-evicted tiled textures because their VRAM bytes were counted as 0"
+        );
+
+        // 4. Evicting the 2 selected victims reclaims exactly 2 * per_tex_bytes of tiles
+        //    while leaving the 4 newer tiled textures resident with intact GPU texels.
+        let tiles_before = crate::tiles::given_total();
+        let mut evicted_bytes = 0u64;
+        for &at in &our_victims {
+            let r = resource(at as This);
+            let gone = r.host.made.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let (ht, _) = gone.expect("victim had host copy");
+            evicted_bytes += ht.card_bytes();
+            drop(ht);
+        }
+        let tiles_after = crate::tiles::given_total();
+        assert_eq!(evicted_bytes, 2 * per_tex_bytes);
+        assert_eq!(tiles_before - tiles_after, 2 * per_tex_bytes);
+        for (i, &t) in backed.iter().enumerate().skip(2) {
+            let fill = 0x11u8.wrapping_mul(i as u8 + 1);
+            assert_eq!(
+                readback_mip0_head(t as This),
+                [fill; 16],
+                "surviving tiled texture {i} must keep its uploaded texels intact"
+            );
+        }
     }
 }
