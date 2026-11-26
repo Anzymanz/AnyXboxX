@@ -250,11 +250,16 @@ fn main() -> Result<()> {
             warm,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
-            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.trim().parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);
             }
-            // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
-            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+            // `VICTORY_HOST_WAVE=32` (or `VICTORY_HOST_MAX_WAVE=32`): translate as for a GPU
+            // whose waves are at most that many lanes.
+            let host_wave = std::env::var("VICTORY_HOST_WAVE")
+                .ok()
+                .or_else(|| std::env::var("VICTORY_HOST_MAX_WAVE").ok())
+                .and_then(|v| v.trim().parse().ok());
+            if let Some(n) = host_wave {
                 victory_shader::emit::set_host_max_wave(n);
             }
             if let Some(file) = warm {

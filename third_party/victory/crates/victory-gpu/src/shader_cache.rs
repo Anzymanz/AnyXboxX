@@ -67,9 +67,14 @@ fn build() -> [u8; 32] {
             None
         }
     });
-    // (Neptune) The view heap's null slot is part of the translation (it differs by host
-    // GPU): found before it goes into the key, so that no translation is made without it.
-    crate::descriptor::host::probe_view_limit();
+    // (Neptune) The view heap's null slot and wave width are part of the translation (they differ
+    // by host GPU): probe the local adapter only when the caller has not already supplied them
+    // (e.g. `victory translate --warm` with `VICTORY_HOST_WAVE` and `VICTORY_VIEW_LIMIT`).
+    if victory_shader::emit::view_heap_limit() == 0 {
+        crate::descriptor::host::probe_view_limit();
+    } else if victory_shader::emit::host_max_wave() == 0 {
+        let _ = crate::host::host();
+    }
     let mut h = blake3::Hasher::new();
     h.update(b"victory shader cache key 2\0");
     if let Some(exe) = exe {
