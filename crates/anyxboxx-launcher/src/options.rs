@@ -37,21 +37,63 @@ pub const ENV_NAMES: [&str; 7] = [
 const WIDTH_RANGE: (u32, u32) = (640, 7680);
 const HEIGHT_RANGE: (u32, u32) = (360, 4320);
 
+/// The "8 GB card" preset: VIctory's own reserves on the card cut down so that the card stays
+/// under the budget Windows gives the game. With the Windows + NVIDIA profile (1536 MB of draw-data
+/// windows, 1536 MB of buffer copies, sized for 12 to 16 GB cards) an RTX 5060 8 GB stood at
+/// 8,010 MB in use against a 6,823 MB budget: Windows moved the rest into the PC's memory (6,096 MB
+/// of shared memory in use, 1,970 MB of RAM left free) and the texture queue was refused for good.
+/// The windows and buffer values are the ones measured on that card at a 5.8 fps median in the
+/// world (2026-11-26, Series X, 1080p display mode, Neptune base; Vice-Tay reads no list pool variable).
+/// `VICTORY_TEXTURE_MAX_SIZE=1024` keeps the levels of the title's textures over 1024 texels off the
+/// card (`victory-gpu` `tiles::max_size`; three quarters of a texture for each level cut), so the
+/// texture queue has room for every texture instead of being refused. It works through the
+/// `VICTORY_LEVELS_ON_DEMAND=1` of the Neptune profile (Vice-Tay's tuned set does not set it, and
+/// it no longer reads `VICTORY_TEXTURE_MAX_SIZE`: see `UNREAD_BY_VICE_TAY` in the tests).
+pub const LOW_VRAM: &[(&str, &str)] = &[
+    ("VICTORY_CARD_WINDOWS_MB", "512"),
+    ("VICTORY_CARD_BUFFERS_MB", "512"),
+    ("VICTORY_TEXTURE_ROOM_PERCENT", "85"),
+    ("VICTORY_TEXTURE_MAX_SIZE", "1024"),
+];
+
+/// The "12 GB card" preset: Fast's speed with headroom. The profile's reserves (1536 MB of windows
+/// and of buffer copies) were sized on 12 to 16 GB cards and measured on a 16 GB one; here they
+/// are 1024 MB each, and the title's textures are capped at 2048 texels (`VICTORY_TEXTURE_MAX_SIZE`,
+/// one level cut on the 4096 ones only), so the texture queue keeps room on a 12 GB card. Not
+/// measured on a 12 GB card yet.
+pub const MID_VRAM: &[(&str, &str)] = &[
+    ("VICTORY_CARD_WINDOWS_MB", "1024"),
+    ("VICTORY_CARD_BUFFERS_MB", "1024"),
+    ("VICTORY_TEXTURE_ROOM_PERCENT", "90"),
+    ("VICTORY_TEXTURE_MAX_SIZE", "2048"),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Preset {
     #[default]
     Fast,
     Quality,
+    /// For cards with 8 GB of video memory or less.
+    LowVram,
+    /// For cards with 12 GB of video memory.
+    MidVram,
 }
 
 impl Preset {
-    pub const ALL: [Preset; 2] = [Preset::Fast, Preset::Quality];
+    pub const ALL: [Preset; 4] = [
+        Preset::Fast,
+        Preset::Quality,
+        Preset::MidVram,
+        Preset::LowVram,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Preset::Fast => "Fast",
             Preset::Quality => "Quality",
+            Preset::LowVram => "8 GB card",
+            Preset::MidVram => "12 GB card",
         }
     }
 
@@ -60,6 +102,12 @@ impl Preset {
             Preset::Fast => "The profile as measured: the best speed known so far.",
             Preset::Quality => {
                 "Picture first: windows and buffers read fresh each frame. About half the frame rate (measured 7 to 9 fps against 14 to 17)."
+            }
+            Preset::LowVram => {
+                "For 8 GB cards: textures capped at 1024 pixels and smaller reserves on the card, so every texture fits and the card stays within its budget instead of spilling into the PC's memory. Pair it with the 1920x1080 display size."
+            }
+            Preset::MidVram => {
+                "For 12 GB cards: Fast with headroom. Textures capped at 2048 pixels (only the largest lose a level) and 1024 MB reserves on the card, so every texture fits. Not measured on a 12 GB card yet."
             }
         }
     }
@@ -70,6 +118,14 @@ impl Preset {
         match self {
             Preset::Fast => Vec::new(),
             Preset::Quality => anyxboxx::run::QUALITY
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            Preset::LowVram => LOW_VRAM
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            Preset::MidVram => MID_VRAM
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
@@ -386,7 +442,67 @@ mod tests {
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
         assert_eq!(quality, expected);
-        assert_eq!(quality.len(), 5);
+        assert_eq!(quality.len(), 3);
+    }
+
+    #[test]
+    fn the_8_gb_preset_cuts_the_card_reserves_below_the_profiles() {
+        let pairs = Preset::LowVram.overrides();
+        let get = |name: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.parse::<u32>().expect("a number"))
+        };
+        let profile = |name: &str| {
+            anyxboxx::run::TUNED
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.parse::<u32>().expect("a number"))
+                .expect("in the tuned set")
+        };
+        for name in ["VICTORY_CARD_WINDOWS_MB", "VICTORY_CARD_BUFFERS_MB"] {
+            let low = get(name).expect("set by the preset");
+            assert!(
+                low < profile(name),
+                "{name}: {low} is not below the profile"
+            );
+        }
+        // The size cap, and the switch it needs in the profile.
+        assert_eq!(get("VICTORY_TEXTURE_MAX_SIZE"), Some(1024));
+        // The texture room is not in the tuned set any more: the preset sits below VIctory's default (90).
+        assert!(get("VICTORY_TEXTURE_ROOM_PERCENT").expect("set by the preset") < 90);
+        assert!(Preset::ALL.contains(&Preset::LowVram));
+    }
+
+    #[test]
+    fn the_12_gb_preset_sits_between_fast_and_the_8_gb_one() {
+        let value = |preset: Preset, name: &str| {
+            preset
+                .overrides()
+                .into_iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.parse::<u32>().expect("a number"))
+                .expect("set by the preset")
+        };
+        let fast = |name: &str| {
+            anyxboxx::run::TUNED
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.parse::<u32>().expect("a number"))
+                .expect("in the tuned set")
+        };
+        for name in ["VICTORY_CARD_WINDOWS_MB", "VICTORY_CARD_BUFFERS_MB"] {
+            let mid = value(Preset::MidVram, name);
+            // Fast's windows are 1024 MB too, since the Vice-Tay set: the buffers carry the difference.
+            assert!(mid <= fast(name), "{name}: {mid} is above Fast");
+            assert!(
+                mid > value(Preset::LowVram, name),
+                "{name}: {mid} is not above 8 GB"
+            );
+        }
+        assert_eq!(value(Preset::MidVram, "VICTORY_TEXTURE_MAX_SIZE"), 2048);
+        assert!(Preset::ALL.contains(&Preset::MidVram));
     }
 
     #[test]
@@ -414,6 +530,11 @@ mod tests {
         assert!(Keyboard::Qwertz.shoulder_keys().contains("Y C"));
     }
 
+    /// Names the launcher still offers that the Vice-Tay base does not read (checked by grep on its
+    /// crates and apps on 2026-11-26): these options do nothing on this base until its sources read
+    /// them or the options are removed.
+    const UNREAD_BY_VICE_TAY: [&str; 1] = ["VICTORY_TEXTURE_MAX_SIZE"];
+
     #[test]
     fn every_variable_an_option_names_exists_in_victorys_sources() {
         let victory = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -430,6 +551,8 @@ mod tests {
         let preset_names: Vec<String> = Preset::Quality
             .overrides()
             .into_iter()
+            .chain(Preset::LowVram.overrides())
+            .chain(Preset::MidVram.overrides())
             .map(|(k, _)| k)
             .collect();
         for name in ENV_NAMES
@@ -437,6 +560,9 @@ mod tests {
             .copied()
             .chain(preset_names.iter().map(String::as_str))
         {
+            if UNREAD_BY_VICE_TAY.contains(&name) {
+                continue;
+            }
             assert!(
                 sources.contains(&format!("\"{name}\"")),
                 "{name} is read nowhere in third_party/victory"
