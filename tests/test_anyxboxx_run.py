@@ -215,7 +215,7 @@ def test_overrides_apply_to_warm_and_run_after_all_switches(tmp_path, fake_tool,
                "--override", "VICTORY_XG_MODE=compare", "--override", "VICTORY_D3D12_DRED="]
     inherited = (("VICTORY_D3D12_DRED", "1"), ("VICTORY_FRAMETIME_DUMP", "parent"))
     done, calls = launch(tmp_path, fake_tool, binary, options, inherited=inherited)
-    expected = (GAME_DIR, "VICTORY_DISCORD=0", "VICTORY_OCEAN_READBACK=1", "VICTORY_AUTO_A=30",
+    expected = (GAME_DIR, "VICTORY_DISCORD=0", "VICTORY_AUTO_A=30",
                 r"VICTORY_XG_DLL=<root>\xg_xs.dll", "VICTORY_XG_MODE=compare")
     env = ";".join(sorted(expected))
     assert calls == [BUILD + "VICTORY_D3D12_DRED=1;VICTORY_FRAMETIME_DUMP=parent",
