@@ -1,52 +1,27 @@
-//! Offline cache warming (`victory translate --warm`) sets `VICTORY_HOST_WAVE`
-//! and `VICTORY_VIEW_LIMIT` so a cache can be warmed for another host GPU
-//! without touching the local adapter. `shader_cache::warm` must not clobber
-//! those explicit host facts by probing the local D3D12 device.
-
 #![cfg(windows)]
 
+use victory_gpu::shader_cache;
+use victory_shader::emit;
+
 #[test]
-fn warm_preserves_explicit_host_wave_and_view_limit() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    victory_gpu::shader_cache::use_shader_cache(dir.path().to_path_buf());
+fn precompile_keeps_explicit_translation_host_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    shader_cache::use_shader_cache(dir.path().join("shaders"));
 
-    // 1. Both host facts explicitly supplied (e.g. warming for a 64-lane / 2M-view
-    //    AMD host on an NVIDIA 32-lane / 1M-view PC): neither is overwritten.
-    victory_shader::emit::set_host_max_wave(64);
-    victory_shader::emit::set_view_heap_limit(2_097_151);
-    let expected_fp = victory_shader::emit::translation_fingerprint();
+    // The CLI sets the view limit and overrides the wave width per warm worker.
+    let limit = 524_287;
+    emit::set_view_heap_limit(limit);
+    std::thread::spawn(move || {
+        emit::set_thread_max_wave(Some(64));
+        // An invalid container still exercises host initialization and cache-key construction.
+        assert!(shader_cache::precompile(b"synthetic").is_err());
+        assert_eq!(emit::host_settings()[..2], [64, limit]);
+    })
+    .join()
+    .unwrap();
 
-    let _ = victory_gpu::shader_cache::warm(b"synthetic");
-
-    assert_eq!(
-        victory_shader::emit::host_max_wave(),
-        64,
-        "shader_cache::warm overwrote explicit VICTORY_HOST_WAVE"
-    );
-    assert_eq!(
-        victory_shader::emit::view_heap_limit(),
-        2_097_151,
-        "shader_cache::warm overwrote explicit VICTORY_VIEW_LIMIT"
-    );
-    assert_eq!(
-        victory_shader::emit::translation_fingerprint(),
-        expected_fp,
-        "shader_cache::warm changed translation_fingerprint despite explicit host facts"
-    );
-
-    // 2. Only VICTORY_HOST_WAVE supplied (`view_heap_limit == 0`): probing the
-    //    local D3D12 adapter populates view_heap_limit without clobbering wave.
-    victory_shader::emit::set_view_heap_limit(0);
-    let _ = victory_gpu::shader_cache::warm(b"synthetic");
-
-    assert_eq!(
-        victory_shader::emit::host_max_wave(),
-        64,
-        "host D3D12 probe overwrote explicit VICTORY_HOST_WAVE"
-    );
-    assert_ne!(
-        victory_shader::emit::view_heap_limit(),
-        0,
-        "missing view_heap_limit was not probed from host D3D12 adapter"
-    );
+    // An unspecified limit is still detected for the local adapter.
+    emit::set_view_heap_limit(0);
+    assert!(shader_cache::precompile(b"synthetic").is_err());
+    assert_ne!(emit::view_heap_limit(), 0);
 }
