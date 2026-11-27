@@ -28,9 +28,9 @@ BUILD_DIAG = (r"cargo build --profile diag -p victory --features diagnostics "
 GAME = r"victory run <root>\game\game_scarlett_master.exe --execute | "
 GAME_DIAG = r"victory run <root>\game\game_scarlett_master.exe --execute | "
 GAME_ARCHIVES = r"<root>\game\A.rpf <root>\game\b.rpf"
-WARM_ARCHIVES = (r"victory warm <root>\game\A.rpf <root>\game\b.rpf | ")
-WARM_PRECOMPILE = (r"victory warm <root>\game\shaders.rpf <root>\game\game_scarlett_master.exe "
-                   r"<root>\game\XboxBvhBuilder.dll <root>\game\amd_fidelityfx_upscaler_xbox.dll | ")
+# Vice-Tay's `warm` takes no files: it remakes the pipelines earlier runs noted.
+WARM_ARCHIVES = r"victory warm | "
+WARM_PRECOMPILE = r"victory warm | "
 
 
 # ---- the golden script and the Rust settings ------------------------------------------------
