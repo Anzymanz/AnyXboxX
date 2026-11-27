@@ -8,11 +8,9 @@
 //! buffer's descriptor from the program's table (a resource of the host,
 //! [`crate::resource::BvhNodes::Resource`]), and the title's way, a
 //! descriptor of numbers over title memory with the structure's address in
-//! the node pointer or in the descriptor. These tests have no host that
-//! keeps copies of title memory and their directory, so for the second
-//! they put a stand-in under the node reader
-//! (`lower::intersect::TEST_MEMORY`); without it the same program reads
-//! through the directory, which is only checked to lower and validate.
+//! the node pointer or in the descriptor. Some tests use a stand-in
+//! (`lower::intersect::TEST_MEMORY`). The directory tests bind synthetic
+//! copies of title memory and exercise the runtime's lookup and fault path.
 
 use super::host::{Dispatch, Host, Root, Stride, View};
 use super::lower::intersect::TEST_MEMORY;
@@ -904,6 +902,132 @@ fn faulted_pages(faults: &[u32]) -> Vec<u32> {
     out
 }
 
+fn directory_records(entries: &[(bool, u64, Ray)]) -> Vec<u32> {
+    let mut data = vec![0u32; (THREADS * RECORD / 4) as usize];
+    for (t, &(active, pointer, ray)) in entries.iter().enumerate() {
+        let r = &mut data[t * (RECORD / 4) as usize..][..13];
+        r[0] = pointer as u32;
+        r[1] = (pointer >> 32) as u32;
+        r[2] = ray.extent.to_bits();
+        for a in 0..3 {
+            r[3 + a] = ray.origin[a].to_bits();
+            r[6 + a] = ray.direction[a].to_bits();
+            r[9 + a] = ray.inverse[a].to_bits();
+        }
+        r[12] = u32::from(active);
+    }
+    data
+}
+
+#[test]
+fn bvh_directory_address_carries_past_four_gib() {
+    const PAGE_BYTES: usize = 1 << 16;
+    const WORD0: u32 = 0x00ff_ffff;
+    let bounds = [30.0, 10.0, 40.0, 20.0].map(|x| [x, -1.0, -1.0, x + 1.0, 1.0, 1.0]);
+    let triangle = nodes::triangles(&[[5.0, 0.0, 2.0], [5.0, 2.0, -2.0], [5.0, -2.0, -2.0]], 9);
+    let triangle_hit = [80.0, 16.0, 4.0, 4.0].map(f32::to_bits);
+    // The two box nodes give different child IDs if the high pointer word is lost.
+    let placements = [
+        (0x00, 0xffff_ff00, triangle, triangle_hit),
+        (
+            0x25,
+            0x1_0000_0000,
+            nodes::box32([0x105, 0x20c, 0x304, 0x400], bounds),
+            [0x20c, 0x400, 0x105, 0x304],
+        ),
+        (0x2020, 0x1_0001_0000, triangle, triangle_hit),
+        (
+            0x1_0000_0025,
+            0x9_0000_0000,
+            nodes::box32([0x505, 0x60c, 0x704, 0x800], bounds),
+            [0x60c, 0x800, 0x505, 0x704],
+        ),
+    ];
+    let mut arena = vec![0; placements.len() * PAGE_BYTES / 4];
+    let mut mappings = Vec::with_capacity(placements.len());
+    let mut entries = Vec::new();
+    let mut expected = Vec::new();
+    let hit = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 100.0);
+    let miss = Ray::new([0.0, 3.0, 0.0], [1.0, 0.0, 0.0], 100.0);
+    for (i, (pointer, address, node, hit_words)) in placements.into_iter().enumerate() {
+        assert_eq!(bvh::node_address(WORD0, bvh::BOX_SORT, pointer), address);
+        let page_start = i * PAGE_BYTES;
+        let byte = page_start + (address % PAGE_BYTES as u64) as usize;
+        arena[byte / 4..][..node.len()].copy_from_slice(&node);
+        mappings.push((
+            (address / PAGE_BYTES as u64) as u32,
+            1,
+            page_start as u32,
+            false,
+        ));
+        let kind = bvh::kind(pointer);
+        let miss_words = if kind == 5 {
+            [bvh::NONE; 4]
+        } else {
+            bvh::MISS.map(f32::to_bits)
+        };
+        for (ray, words) in [(hit, hit_words), (miss, miss_words)] {
+            entries.push((true, pointer, ray));
+            let cpu = bvh::intersect(&node, kind, &ray, true);
+            assert_eq!(cpu, words, "CPU result for {pointer:#x}, ray {ray:?}");
+            expected.push(cpu);
+        }
+    }
+    let directory = make_directory(mappings.last().unwrap().0 + 2, &mappings);
+    let descriptor = Descriptor::Numbers(WORD0, bvh::BOX_SORT);
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for warp in [false, true] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 device for warp={warp}; skipped");
+            continue;
+        };
+        let adapter = host.adapter_name();
+        eprintln!("BVH 4 GiB carry adapter: {adapter:?}");
+        for (wide, lanes) in [(false, entries.len() - 2), (true, entries.len())] {
+            let (shader, _) = build(wide, descriptor).expect("directory shader lowers");
+            let (root, pso) = host.compute_pipeline(&shader).expect("directory pipeline");
+            let records = directory_records(&entries[..lanes]);
+            let ud = user_data_constants(&shader, [0; 4], 0, 2, 0);
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (1, Root::Uav(super::MEMORY_FAULTS)),
+                            (2, Root::DeviceSrv(directory.clone())),
+                        ],
+                        views: &[
+                            View::DeviceRawSrv(&records),
+                            View::RawUav(4 * THREADS),
+                            View::NullRawUav,
+                            View::RawUavData(&arena),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("directory dispatch");
+            for (t, (got, want)) in out[0].chunks_exact(4).zip(&expected[..lanes]).enumerate() {
+                let (_, pointer, _) = entries[t];
+                assert_eq!(
+                    got, want,
+                    "{adapter:?}, wide={wide}, lane {t}, pointer {pointer:#x}"
+                );
+            }
+            let faults = faulted_pages(&out[1]);
+            assert!(faults.is_empty(), "{adapter:?}, wide={wide}: unexpected faults {faults:#x?}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}
+
 /// Real runtime directory path (`Lower::memory` with `SLOT_MEMORY`,
 /// `SLOT_FAULTS`, and `USER_MEMORY_BASE`, without `TEST_MEMORY`):
 /// verifies multi-arena reads, 128-byte `box32` nodes straddling a 64 KiB
@@ -989,22 +1113,6 @@ fn real_directory_memory_path_handles_cross_page_unmapped_and_no_spurious_faults
     let ray_z = Ray::new([0.0; 3], [0.0, 0.0, 1.0], 100.0);
 
     let ptr_at = |addr: u64, kind: u32| -> u64 { (addr >> 3) | u64::from(kind) };
-    let make_records = |entries: &[(bool, u64, Ray)]| -> Vec<u32> {
-        let mut data = vec![0u32; (THREADS * RECORD / 4) as usize];
-        for (t, &(active, pointer, ray)) in entries.iter().enumerate() {
-            let r = &mut data[t * (RECORD / 4) as usize..][..13];
-            r[0] = pointer as u32;
-            r[1] = (pointer >> 32) as u32;
-            r[2] = ray.extent.to_bits();
-            for a in 0..3 {
-                r[3 + a] = ray.origin[a].to_bits();
-                r[6 + a] = ray.direction[a].to_bits();
-                r[9 + a] = ray.inverse[a].to_bits();
-            }
-            r[12] = u32::from(active);
-        }
-        data
-    };
 
     // Batch 1: ONLY mapped nodes + masked-out unmapped lanes + active kind 6/7 (NONE) unmapped lanes.
     // Expected: ZERO faults in SLOT_FAULTS!
@@ -1085,7 +1193,7 @@ fn real_directory_memory_path_handles_cross_page_unmapped_and_no_spurious_faults
         let ud = user_data_constants(&shader, [0; 4], 0, 2, 0);
 
         // Run Batch 1
-        let rec1 = make_records(&batch1_entries);
+        let rec1 = directory_records(&batch1_entries);
         let out1 = host
             .dispatch(
                 &root,
@@ -1122,7 +1230,7 @@ fn real_directory_memory_path_handles_cross_page_unmapped_and_no_spurious_faults
         );
 
         // Run Batch 2
-        let rec2 = make_records(&batch2_entries);
+        let rec2 = directory_records(&batch2_entries);
         let out2 = host
             .dispatch(
                 &root,
@@ -1762,14 +1870,20 @@ fn bench_bvh64_intersect_on_gpu() {
         }
 
         times_ms.sort_by(|a, b| a.total_cmp(b));
-        let median = times_ms[times_ms.len() / 2];
+        let median = (times_ms[(times_ms.len() - 1) / 2] + times_ms[times_ms.len() / 2]) / 2.0;
+        let p95 = times_ms[(95 * times_ms.len()).div_ceil(100) - 1];
         let min = times_ms[0];
         let mean = times_ms.iter().sum::<f64>() / times_ms.len() as f64;
         let total_calls = (TOTAL_THREADS as f64) * (ITERS as f64);
         let m_per_s = (total_calls / 1e6) / (median / 1e3);
         let faults = faulted_pages(&out[1]);
+        let mut hash = blake3::Hasher::new();
+        for word in &out[0] {
+            hash.update(&word.to_le_bytes());
+        }
+        let output = hash.finalize().to_hex();
         eprintln!(
-            "BENCH {name:18} | median {median:7.3} ms | min {min:7.3} ms | mean {mean:7.3} ms | {m_per_s:7.1} M tests/s | faults={}",
+            "BENCH {name:18} | median {median:8.4} ms | p95 {p95:8.4} ms | min {min:8.4} ms | mean {mean:8.4} ms | {m_per_s:7.1} M tests/s | faults={} | output={output}",
             faults.len()
         );
     }
