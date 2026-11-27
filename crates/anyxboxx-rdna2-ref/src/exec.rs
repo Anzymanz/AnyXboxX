@@ -286,6 +286,11 @@ pub fn step(wave: &mut Wave, data: &[u8]) -> Result<bool, Error> {
         wave.pc = next_pc;
         return Ok(true);
     }
+    if family == "VOP1" && crate::f16conv::supports(&name) {
+        crate::f16conv::execute(wave, &name, word, literal)?;
+        wave.pc = next_pc;
+        return Ok(true);
+    }
     if vector_family {
         if !execute_vector(wave, &name, family, word, literal)? {
             return Err(refused());

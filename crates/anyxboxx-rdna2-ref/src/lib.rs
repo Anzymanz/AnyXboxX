@@ -30,6 +30,7 @@ pub mod export;
 pub mod ext;
 pub mod ext_compare;
 pub mod f16;
+pub mod f16conv;
 pub mod flat;
 pub mod float;
 pub mod format_access;
