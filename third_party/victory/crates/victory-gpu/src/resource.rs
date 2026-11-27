@@ -1183,6 +1183,13 @@ pub(crate) struct HostTexture {
     /// Made in place of one with fewer levels: the slots that show that one
     /// are made again once this one was filled whole.
     pub(crate) grown: std::sync::atomic::AtomicBool,
+    /// Taken out of its texture's host side for a copy with other levels
+    /// ([`want_level`], [`keep_whole`]), said before the texture's staging
+    /// buffer is let go: a staging buffer made for this copy after that (by
+    /// a thread that took it before) is not kept as the texture's
+    /// (`crate::texture` `staging`), so the first level a read finds staged
+    /// ([`staged_first`]) is never this copy's.
+    pub(crate) replaced: std::sync::atomic::AtomicBool,
     /// What the last submitted upload put in it.
     pub(crate) holds: std::sync::Arc<Holds>,
     /// Who makes its first upload (`crate::texture::ahead`).
@@ -1415,7 +1422,9 @@ pub(crate) fn want_level(this: This, first: u32) {
         return;
     }
     r.host.wanted.store(first, Relaxed);
-    // Under the lock, as in `let_go_idle`.
+    // Under the lock, as in `let_go_idle`; said of the copy first (see
+    // [`HostTexture::replaced`]).
+    host.replaced.store(true, Relaxed);
     crate::texture::unstage(this);
     r.host.grown.store(true, Relaxed);
     HELD[2].fetch_add(1, Relaxed);
@@ -1460,9 +1469,12 @@ pub(crate) fn keep_whole(this: This) {
     }
     CAP_LIFTED.fetch_add(1, Relaxed);
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-    if !r.host.capped.swap(false, Relaxed) || made.is_none() {
+    let capped = r.host.capped.swap(false, Relaxed);
+    let Some((host, _)) = made.as_ref().filter(|_| capped) else {
         return;
-    }
+    };
+    // See [`HostTexture::replaced`].
+    host.replaced.store(true, Relaxed);
     crate::texture::unstage(this);
     r.host.grown.store(true, Relaxed);
     if let Some(old) = made.take() {
@@ -2527,6 +2539,7 @@ impl HostTexture {
             base: 0,
             serial: SERIAL.fetch_add(1, Relaxed) + 1,
             grown: Default::default(),
+            replaced: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             prefill: Default::default(),
@@ -2554,6 +2567,7 @@ impl HostTexture {
             base: 0,
             serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
             grown: Default::default(),
+            replaced: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             prefill: Default::default(),

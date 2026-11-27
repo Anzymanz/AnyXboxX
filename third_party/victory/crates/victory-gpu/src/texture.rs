@@ -2068,6 +2068,12 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         waiting: std::sync::atomic::AtomicU64::new(0),
         exact: std::sync::atomic::AtomicBool::new(BAKING.get()),
     });
+    // A copy its texture no longer has (a thread took it before the swap
+    // let the texture's staging go): this list uploads it, but the
+    // texture's staging and staged level stay those of its new copy.
+    if copy.replaced.load(std::sync::atomic::Ordering::Relaxed) {
+        return Some(s);
+    }
     map.insert(resource as usize, s.clone());
     crate::resource::set_staged_first(resource, s.first);
     Some(s)
