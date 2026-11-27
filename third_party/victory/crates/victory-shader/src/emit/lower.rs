@@ -4537,7 +4537,7 @@ impl<'a> Lower<'a> {
     fn trig_turns(&mut self, x: V, cosine: bool) -> V {
         let c = self.cur;
         let zero = self.s.m.f32(0);
-        let whole = self.unary(26, x);
+        let whole = self.rndne_f32(x);
         let part = self.s.m.bin(c, Bin::Sub, x, whole);
         let is_zero = self.s.m.cmp(c, pred::OEQ, x, zero);
         let part = self.s.m.select(c, is_zero, x, part);
@@ -12286,7 +12286,7 @@ impl<'a> Lower<'a> {
                         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
                         let zero = self.s.m.f32(0);
                         let lod = self.binary(35, lod, zero); // maximum
-                        let lod = self.unary(26, lod); // round to nearest
+                        let lod = self.rndne_f32(lod); // round to nearest even
                         let mip = self.s.m.cast(c, Cast::FpToUi, lod, i32t);
                         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
                         let d = self
