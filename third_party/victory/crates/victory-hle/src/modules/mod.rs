@@ -42,6 +42,7 @@ pub mod xmem;
 pub mod xnetworking;
 pub mod xpackage;
 pub mod xstore;
+pub mod window_identity;
 pub mod xsystem;
 pub mod xuser;
 

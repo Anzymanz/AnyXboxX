@@ -15,6 +15,9 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+/// The name of the title's window; its caption reads `AnyXboxX | {fps} fps ...`.
+pub const WINDOW_NAME: &str = "AnyXboxX";
+
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
