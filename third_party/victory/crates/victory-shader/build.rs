@@ -44,17 +44,20 @@ fn skip_file(rel: &str) -> bool {
 }
 
 /// `VICTORY_*` string literals inside translator source files that do not
-/// change translated DXIL: compile-time `env!()` keys, diagnostic `*_WHY`
-/// loggers, and test-only reference shader overrides inside `mod tests`.
+/// change translated DXIL: compile-time `env!()` keys, explicitly listed
+/// diagnostic-only loggers (never a wildcard suffix, so new switches fail
+/// closed into the cache key), and test-only reference shader overrides inside
+/// `mod tests`.
 fn skip_switch(name: &str) -> bool {
-    name.ends_with("_WHY")
-        || matches!(
-            name,
-            "VICTORY_SHADER_SOURCE_HASH"
-                | "VICTORY_SHADER_SWITCHES"
-                | "VICTORY_REF_VS"
-                | "VICTORY_REF_PS"
-        )
+    matches!(
+        name,
+        "VICTORY_DESC_WHY"
+            | "VICTORY_WAVE_WHY"
+            | "VICTORY_SHADER_SOURCE_HASH"
+            | "VICTORY_SHADER_SWITCHES"
+            | "VICTORY_REF_VS"
+            | "VICTORY_REF_PS"
+    )
 }
 
 fn main() {
