@@ -44,6 +44,10 @@ fn execute_vector(
     if vector::is_no_operation(name) {
         return Ok(true);
     }
+    if crate::f16::supports(name) {
+        crate::f16::execute(wave, name, family, word, literal)?;
+        return Ok(true);
+    }
     let fields = vector::fields(family, word);
     let carry = family == "VOP2" && vector::is_carry(name);
     if EXTENSION_CODES.contains(&(word & 0x1FF)) {

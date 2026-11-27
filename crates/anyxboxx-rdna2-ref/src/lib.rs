@@ -28,6 +28,7 @@ pub mod exec;
 pub mod export;
 pub mod ext;
 pub mod ext_compare;
+pub mod f16;
 pub mod flat;
 pub mod float;
 pub mod format_access;
