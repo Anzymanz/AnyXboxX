@@ -88,13 +88,7 @@ impl Victory {
     /// The warm before a first launch (`--precompile`): checks that shaders.rpf, the game and its
     /// two DLLs are there, then runs `victory warm` with the game's environment.
     pub fn precompile_command(&self, game_dir: &Path, env: &Env) -> Result<Command, RunError> {
-        let shaders = game_dir.join(SHADERS);
-        let dlls: Vec<PathBuf> = PRECOMPILED_DLLS.iter().map(|d| game_dir.join(d)).collect();
-        for needed in std::iter::once(&shaders).chain(&dlls) {
-            if !needed.is_file() {
-                return Err(RunError::PrecompileInput(needed.display().to_string()));
-            }
-        }
+        validate_precompile_inputs(game_dir)?;
         // Vice-Tay's `warm` reads no files: the inputs are checked so a broken game folder still
         // fails here, as before, and the command is the plain warm.
         let mut command = Command::new(&self.exe);
@@ -113,6 +107,17 @@ impl Victory {
         apply_env(&mut command, env);
         command
     }
+}
+
+/// Check the extra inputs required for a first launch.
+pub(super) fn validate_precompile_inputs(game_dir: &Path) -> Result<(), RunError> {
+    for name in std::iter::once(SHADERS).chain(PRECOMPILED_DLLS) {
+        let needed = game_dir.join(name);
+        if !needed.is_file() {
+            return Err(RunError::PrecompileInput(needed.display().to_string()));
+        }
+    }
+    Ok(())
 }
 
 /// The `.rpf` archives directly in `game_dir`, sorted by name (never the folder's other trees).
