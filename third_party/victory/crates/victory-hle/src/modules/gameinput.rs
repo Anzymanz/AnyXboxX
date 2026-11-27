@@ -532,10 +532,6 @@ impl State {
     /// Logs the stand-in pad's held virtual keys and trigger levels once per
     /// change (at `info!` with `VICTORY_INPUT_TRACE=1`, `debug!` otherwise).
     fn trace_stand_in_triggers(&mut self, keys: &[KeyState], pad: PadState, one_pad: bool) {
-        let mut vks: Vec<u8> = keys.iter().map(|k| k.virtual_key).collect();
-        vks.sort_unstable();
-        vks.dedup();
-        let next = (vks, pad.left_trigger.to_bits(), pad.right_trigger.to_bits());
         let trigger_active = pad.left_trigger != 0.0 || pad.right_trigger != 0.0;
         let had_active = self
             .last_trigger_trace
@@ -544,6 +540,10 @@ impl State {
         if !trigger_active && !had_active && !input_trace_info() {
             return;
         }
+        let mut vks: Vec<u8> = keys.iter().map(|k| k.virtual_key).collect();
+        vks.sort_unstable();
+        vks.dedup();
+        let next = (vks, pad.left_trigger.to_bits(), pad.right_trigger.to_bits());
         if self.last_trigger_trace.as_ref() == Some(&next) {
             return;
         }
