@@ -35,6 +35,8 @@ Co-authored-by: Nom <e-mail>
 
 Depuis le 26 novembre au soir, la base est **[TaynanGT/Vice-Tay](https://github.com/TaynanGT/Vice-Tay)** (Taynan Piza et ses contributeurs, GPL-3.0 ou ultérieure) au commit `a252348`, sans son dossier `.github` (commit « chore: move third_party/victory to the Vice-Tay base »), puis nos changements, chacun dans son commit : la colle AnyXboxX (clavier, fenêtre sans bordure, `EraFields`, emplacements `XThread`), l'oracle XG, l'overlay, l'appui automatique sur A et la Rich Presence Discord, repris de la base Neptune ci-dessous. Vice-Tay est lui-même bâti sur Marvisak/VIctory et ses forks ; ses crédits sont dans `third_party/victory/docs/credits.md`. Mesuré sur RTX 4070 SUPER, Series X, cache chaud : environ 20 fps médians dans le monde contre 14,2 pour la base Neptune.
 
+Repris ensuite sur la base Vice-Tay : [KainanP/VIctory](https://github.com/KainanP/VIctory) (KainanP, fork de Marvisak/VIctory, GPL-3.0 ou ultérieure), banc des appels de liste (branche `perf/list-call-bench`, test ignoré `pipeline::list_bench`).
+
 Du 25 au 26 novembre, la base était **Neptune (VIctory Edit.) 2026-11-25c** : la source correspondante livrée avec son paquet (`neptune-ve-source.zip`, GPL-3.0 ou ultérieure), committée telle quelle (commit « feat: VIctory base moved to Neptune (VIctory Edit.) 2026-11-25c »), puis nos changements, chacun dans son commit. Aucune dépendance git ni chemin hors de l'arbre : `Cargo.toml` et `Cargo.lock` ne prennent que crates.io.
 
 | Dépôt d'origine | Licence | Dans la base Neptune (d'après son `NEPTUNE-README.txt`) | Repris après |
