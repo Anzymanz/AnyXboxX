@@ -51,8 +51,11 @@ fn execute_vector(
     let fields = vector::fields(family, word);
     let carry = family == "VOP2" && vector::is_carry(name);
     if EXTENSION_CODES.contains(&(word & 0x1FF)) {
-        if crate::wide::spec(name).is_some() || crate::movrel::is_vector(name) {
-            // 64-bit operations take no extension word: refused before any lane, as the Python does.
+        if crate::wide::spec(name).is_some()
+            || crate::movrel::is_vector(name)
+            || crate::f16_trans::supports(name)
+        {
+            // 64-bit, movrel and f16 transcendental operations take no extension word: refused before any lane.
             return Err(Error::Untranslated(format!(
                 "instruction non traduite : {name} (SDWA/DPP)"
             )));
@@ -80,6 +83,10 @@ fn execute_vector(
             false,
             0,
         )?;
+        return Ok(true);
+    }
+    if family == "VOP1" && crate::f16_trans::supports(name) {
+        crate::f16_trans::execute(wave, name, word, literal)?;
         return Ok(true);
     }
     if carry {

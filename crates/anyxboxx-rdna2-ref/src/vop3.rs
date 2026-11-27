@@ -418,6 +418,10 @@ pub fn execute(
             "{name} avec op_sel/clamp (VOP3, résultat 16 bits)"
         )));
     }
+    if crate::f16_trans::supports(name) {
+        crate::f16_trans::execute_vop3(wave, name, word, literal)?;
+        return Ok(true);
+    }
     if crate::vop3_forms::operation(wave, name, opcode, &fields, literal)? {
         return Ok(true);
     }
