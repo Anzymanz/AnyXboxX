@@ -14,12 +14,34 @@ fn enabled(value: Option<&OsStr>) -> bool {
     value == Some(OsStr::new("1"))
 }
 
-pub(in crate::host) fn forward(steps: &[Step], src: usize, len: usize) -> Option<usize> {
+/// Where a fill of `[src, src + len)` recorded now takes its bytes
+/// ([`forwarded`]), given the list's steps and its copies at their place out
+/// of upload memory since its last `Step::Run` (`placed`: index, destination,
+/// bytes). Only such a copy that holds the whole fill can give it its bytes,
+/// so the walk starts at the earliest of those (none: nothing to walk), and a
+/// fill in a list without one costs nothing more than the look at `placed`.
+/// What it finds is what a walk of every step finds: the steps before that
+/// copy are a `Run` (which ends the walk with nothing) or steps that cannot
+/// give the fill its bytes.
+pub(in crate::host) fn forward(steps: &[Step], placed: &[(usize, usize, usize)], src: usize, len: usize) -> Option<usize> {
     fill_after_copy().then_some(())?;
-    forwarded(steps.iter().rev().map(Seen::from), src, len)
+    let from = start(placed, src, len)?;
+    forwarded(steps.get(from..)?.iter().rev().map(Seen::from), src, len)
+}
+
+/// The index of the earliest of `placed` whose destination holds all of
+/// `[src, src + len)`.
+fn start(placed: &[(usize, usize, usize)], src: usize, len: usize) -> Option<usize> {
+    let to = src.checked_add(len)?;
+    placed
+        .iter()
+        .filter(|&&(_, dst, n)| dst <= src && dst.checked_add(n).is_some_and(|end| to <= end))
+        .map(|&(at, _, _)| at)
+        .min()
 }
 
 /// List steps projected onto the ranges relevant to forwarding.
+#[derive(Clone, Copy, Debug)]
 enum Seen {
     Placed {
         dst: usize,
@@ -209,6 +231,70 @@ mod tests {
             forwarded([Seen::Writes(usize::MAX, 1), placed(100, 200, 20)], 100, 20),
             None
         );
+    }
+
+    /// What the list keeps for [`forward`] as `steps` are recorded: copies
+    /// out of upload memory since the last "anything" step.
+    fn placements(steps: &[Seen]) -> Vec<(usize, usize, usize)> {
+        let mut placed = Vec::new();
+        for (at, step) in steps.iter().enumerate() {
+            match *step {
+                Seen::Placed { dst, len, upload: Some(_), .. } => placed.push((at, dst, len)),
+                Seen::Anything => placed.clear(),
+                _ => {}
+            }
+        }
+        placed
+    }
+
+    /// [`forward`]'s walk: from the earliest copy that holds the fill.
+    fn bounded(steps: &[Seen], src: usize, len: usize) -> Option<usize> {
+        let from = start(&placements(steps), src, len)?;
+        forwarded(steps[from..].iter().rev().copied(), src, len)
+    }
+
+    #[test]
+    fn the_bounded_walk_finds_what_the_whole_walk_finds() {
+        // Lists of every kind of step over a few ranges, the fill at each.
+        let mut seed = 0x2545_f491_u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n) as usize
+        };
+        for _ in 0..4000 {
+            let steps: Vec<Seen> = (0..next(12))
+                .map(|_| match next(6) {
+                    0 | 1 => placed(100 + 10 * next(4), 200 + 10 * next(4), 10 + 10 * next(3)),
+                    2 => Seen::Placed { dst: 100 + 10 * next(4), src: 200, len: 20, upload: None },
+                    3 => Seen::Writes(100 + 10 * next(15), 1 + next(20)),
+                    4 => Seen::Anything,
+                    _ => Seen::Nothing,
+                })
+                .collect();
+            let (src, len) = (100 + 5 * next(10), 1 + next(30));
+            let whole = forwarded(steps.iter().rev().copied(), src, len);
+            assert_eq!(bounded(&steps, src, len), whole, "{steps:?} fill {src}+{len}");
+        }
+    }
+
+    #[test]
+    fn a_long_list_without_a_copy_that_holds_the_fill_is_not_walked() {
+        let mut steps: Vec<Seen> = (0..100_000).map(|i| Seen::Writes(10_000 + 8 * i, 4)).collect();
+        assert_eq!(start(&placements(&steps), 100, 20), None);
+        // A copy elsewhere, or one that holds only part of the fill: still no walk.
+        steps.push(placed(500, 600, 20));
+        steps.push(placed(100, 300, 10));
+        assert_eq!(start(&placements(&steps), 100, 20), None);
+        // One that holds it, near the end: the walk is the few steps behind it.
+        steps.push(placed(100, 200, 20));
+        steps.push(Seen::Nothing);
+        assert_eq!(start(&placements(&steps), 100, 20), Some(100_002));
+        assert_eq!(bounded(&steps, 100, 20), Some(300));
+        // Behind a step that may write anything there is nothing to walk.
+        steps.push(Seen::Anything);
+        assert_eq!(start(&placements(&steps), 100, 20), None);
     }
 
     #[test]

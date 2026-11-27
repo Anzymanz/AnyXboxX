@@ -2402,6 +2402,11 @@ struct Deferred {
     /// Scratch memory [`HostList::fill_scratch`] fills since the list last
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
+    /// Copies at their place out of upload memory since the list's last
+    /// `Step::Run` (index in `copies`, destination, bytes): the only steps a
+    /// fill can take its bytes from (`place::forward`, with
+    /// `VICTORY_FILL_AFTER_COPY=1`; empty otherwise).
+    forward_placed: Vec<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -7304,7 +7309,7 @@ impl HostList {
     fn defer_upload_fill(&self, dst: *mut u8, src: *const u8, len: usize, to: Option<card_steps::FillTo>) {
         let mut deferred = self.deferred();
         let (dst, src) = (dst as usize, src as usize);
-        let step = if let Some(upload) = place::forward(&deferred.copies, src, len) {
+        let step = if let Some(upload) = place::forward(&deferred.copies, &deferred.forward_placed, src, len) {
             Step::ForwardedFill(dst, upload, len)
         } else {
             Step::Fill(dst, src, len, to)
@@ -7682,6 +7687,8 @@ impl HostList {
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
+        // A fill behind this takes nothing from a copy ahead of it.
+        deferred.forward_placed.clear();
         deferred.title_written();
         drop(deferred);
         self.changed_something();

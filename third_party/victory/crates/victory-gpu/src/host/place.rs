@@ -290,6 +290,10 @@ impl HostList {
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
         let mut deferred = self.deferred();
+        if scratch.is_some() && fill_after_copy() {
+            let at = deferred.copies.len();
+            deferred.forward_placed.push((at, dst, len));
+        }
         deferred.copies.push(Step::Placed(Placed {
             dst,
             src,
