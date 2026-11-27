@@ -383,6 +383,10 @@ pub fn execute(
     if crate::vector::is_no_operation(name) {
         return Ok(true);
     }
+    if crate::cmpf16::supports(name) {
+        crate::cmpf16::execute_vop3(wave, name, word, literal)?;
+        return Ok(true);
+    }
     if crate::vop3_forms::lane(wave, name, &fields, literal)?
         || crate::vop3_forms::mad64(wave, name, &fields, literal)?
     {

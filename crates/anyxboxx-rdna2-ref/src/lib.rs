@@ -16,6 +16,7 @@
 pub mod atomic;
 pub mod atomic_float;
 pub mod buffer_format;
+pub mod cmpf16;
 pub mod compare;
 pub mod decode;
 pub mod div;
