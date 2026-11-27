@@ -72,24 +72,26 @@ impl Victory {
         Some(command)
     }
 
-    /// `victory warm <archives>` with the game's environment (the cache key depends on it).
+    /// `victory warm` with the game's environment (the cache key depends on it). On the Vice-Tay
+    /// base `warm` takes no archives: it makes the host pipelines of every pipeline earlier runs
+    /// noted, so the driver's cache has them before the game asks. `archives` only enter the warm
+    /// fingerprint (`warm_state`), never the command line, which Vice-Tay refuses.
     pub fn warm_command(&self, archives: &[PathBuf], env: &Env) -> Command {
+        let _ = archives;
         let mut command = Command::new(&self.exe);
-        command.arg("warm").args(archives);
+        command.arg("warm");
         command.envs(pairs(env));
         command
     }
 
-    /// `victory warm` on shaders.rpf, the game and its two DLLs (`--precompile`), with the game's
-    /// environment. Only these files of the game folder are read, never the folder around them.
+    /// The warm before a first launch (`--precompile`): checks that shaders.rpf, the game and its
+    /// two DLLs are there, then runs `victory warm` with the game's environment.
     pub fn precompile_command(&self, game_dir: &Path, env: &Env) -> Result<Command, RunError> {
-        let (shaders, dlls) = precompile_files(game_dir)?;
+        validate_precompile_inputs(game_dir)?;
+        // Vice-Tay's `warm` reads no files: the inputs are checked so a broken game folder still
+        // fails here, as before, and the command is the plain warm.
         let mut command = Command::new(&self.exe);
-        command
-            .arg("warm")
-            .arg(&shaders)
-            .arg(game_dir.join(GAME_EXE))
-            .args(&dlls);
+        command.arg("warm");
         command.envs(pairs(env));
         Ok(command)
     }
@@ -106,38 +108,15 @@ impl Victory {
     }
 }
 
-fn precompile_files(game_dir: &Path) -> Result<(PathBuf, [PathBuf; 2]), RunError> {
-    let dlls = PRECOMPILED_DLLS.map(|name| game_dir.join(name));
-    let shaders = game_dir.join(SHADERS);
-    for needed in std::iter::once(&shaders).chain(&dlls) {
+/// Check the extra inputs required for a first launch.
+pub(super) fn validate_precompile_inputs(game_dir: &Path) -> Result<(), RunError> {
+    for name in std::iter::once(SHADERS).chain(PRECOMPILED_DLLS) {
+        let needed = game_dir.join(name);
         if !needed.is_file() {
             return Err(RunError::PrecompileInput(needed.display().to_string()));
         }
     }
-    Ok((shaders, dlls))
-}
-
-/// Validate the requested inputs and preserve archive order. On Windows the shader archive
-/// can have different casing in the directory listing and still be the same precompile input.
-pub(super) fn warm_inputs(args: &RunArgs) -> Result<Vec<PathBuf>, RunError> {
-    let mut inputs = if args.warm {
-        warm_archives(&args.game_dir)?
-    } else {
-        Vec::new()
-    };
-    if args.precompile {
-        let (shaders, dlls) = precompile_files(&args.game_dir)?;
-        for input in [shaders, args.game_dir.join(GAME_EXE)].into_iter().chain(dlls) {
-            let already_present = inputs.iter().any(|path| {
-                path == &input
-                    || cfg!(windows) && path.as_os_str().eq_ignore_ascii_case(input.as_os_str())
-            });
-            if !already_present {
-                inputs.push(input);
-            }
-        }
-    }
-    Ok(inputs)
+    Ok(())
 }
 
 /// The `.rpf` archives directly in `game_dir`, sorted by name (never the folder's other trees).

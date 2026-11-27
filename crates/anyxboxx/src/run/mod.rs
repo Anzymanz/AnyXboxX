@@ -1,7 +1,7 @@
 //! `anyxboxx run`: builds VIctory (cargo does nothing when it is current) and launches it on the
 //! user's own game folder. Rust replacement of main's `tools/lancer_victory.ps1`: same checks,
 //! same build, same environment (`tests/fixtures/lancer_victory_neptune.ps1` is the golden copy),
-//! and the same exit code. Warm and precompile share one invocation when both are requested.
+//! same exit code. On Vice-Tay, warm and precompile share a pipeline-cache warm.
 
 mod settings;
 mod steps;
@@ -11,7 +11,7 @@ use std::process::Command;
 
 use clap::{Args, ValueEnum};
 
-pub use settings::{ALWAYS, LINUX_AMD, QUALITY, TUNED};
+pub use settings::{ALWAYS, LINUX_AMD, QUALITY, TUNED, logical_cpus, pool_sizes};
 pub use steps::{
     Env, GAME_EXE, PRECOMPILED_DLLS, SHADERS, Victory, environment, game_exe, status, warm_archives,
 };
@@ -88,10 +88,10 @@ pub struct RunArgs {
     /// Turn on device-removed data (VICTORY_D3D12_DRED); needs the diagnostics build, so implies --diag.
     #[arg(long, alias = "Dred")]
     pub dred: bool,
-    /// Run `victory warm` on the game folder's own .rpf archives before the game (about 7 min the first time).
+    /// Check for .rpf archives and warm the recorded host pipelines before the game.
     #[arg(long, alias = "Warm")]
     pub warm: bool,
-    /// Warm shaders.rpf, the game executable and its two DLLs before the game.
+    /// Check the shader archive and required DLLs, then warm the recorded host pipelines.
     #[arg(long, alias = "Precompile")]
     pub precompile: bool,
     /// Your own copy of the GDK's offline PC xg_xs.dll (never in this repository).
@@ -154,7 +154,12 @@ pub fn run(args: &RunArgs, repo: Option<&Path>) -> Result<i32, RunError> {
         (None, None) => return Err(RunError::NoRepo),
     };
     game_exe(&args.game_dir)?;
-    let warm = steps::warm_inputs(args)?;
+    if args.warm {
+        warm_archives(&args.game_dir)?;
+    }
+    if args.precompile {
+        steps::validate_precompile_inputs(&args.game_dir)?;
+    }
     if let Some(mut build) = victory.build_command() {
         let profile = if args.uses_diag() {
             "diag profile, diagnostics feature"
@@ -169,15 +174,11 @@ pub fn run(args: &RunArgs, repo: Option<&Path>) -> Result<i32, RunError> {
     }
     let env = environment(args)?;
     if args.warm {
-        println!(
-            "Warming the shader cache from {} game files (several minutes the first time)...",
-            warm.len()
-        );
+        println!("Warming the host pipeline cache...");
+        warm_or_fail(&mut victory.warm_command(&[], &env))?;
     } else if args.precompile {
-        println!("Precompiling the shaders of shaders.rpf, the game and its DLLs into the cache...");
-    }
-    if !warm.is_empty() {
-        warm_or_fail(&mut victory.warm_command(&warm, &env))?;
+        println!("Preparing the recorded host pipelines before launch...");
+        warm_or_fail(&mut victory.warm_command(&[], &env))?;
     }
     status(&mut victory.game_command(&args.game_dir, &env), "victory")
 }
