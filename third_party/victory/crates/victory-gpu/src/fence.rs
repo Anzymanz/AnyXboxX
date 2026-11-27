@@ -6,7 +6,7 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::object::{self, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
+use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
 pub(crate) const FENCE_IIDS: [Iid; 5] = [
@@ -123,6 +123,62 @@ extern "system" fn completed_called(this: This) -> u64 {
     crate::timeline::polled(this as usize, value);
     value
 }
+/// Maximum time a blocking null-event fence wait will wait before giving up
+/// instead of hanging the title thread forever.
+#[cfg(windows)]
+const NULL_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(windows)]
+fn wait_null_event(
+    fence: &Fence,
+    value: u64,
+    mut waiters: std::sync::MutexGuard<'_, Vec<(u64, usize)>>,
+    timeout: std::time::Duration,
+) -> HRESULT {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+    // SAFETY: a private, initially unsignaled event.
+    let handle = match unsafe { CreateEventW(None, false, false, None) } {
+        Ok(handle) => handle,
+        Err(error) => return error.code().0,
+    };
+    waiters.push((value, handle.0 as usize));
+    drop(waiters);
+    // A queued signal may follow work that has not been submitted or settled yet.
+    crate::queue::before_sync();
+    crate::host::settle_for_fence();
+    let deadline = std::time::Instant::now() + timeout;
+    let result = loop {
+        // A direct write to the exposed fence word or settle_for_fence() may already have reached value.
+        if fence.value.load(Ordering::Acquire) >= value {
+            break S_OK;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            tracing::warn!(value, "blocking fence wait timed out");
+            break E_NOTIMPL;
+        }
+        let ms = (deadline - now).as_millis().min(10) as u32;
+        // SAFETY: this call owns the event until it unregisters the waiter.
+        match unsafe { WaitForSingleObject(handle, ms.max(1)) } {
+            WAIT_OBJECT_0 => break S_OK,
+            WAIT_TIMEOUT => {
+                if fence.value.load(Ordering::Acquire) >= value {
+                    break S_OK;
+                }
+                crate::queue::release_held(false);
+            }
+            _ => break windows::core::Error::from_thread().code().0,
+        }
+    };
+    let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+    waiters.retain(|&(_, pending)| pending != handle.0 as usize);
+    // SAFETY: no signal can still use this event after unregistering it.
+    let _ = unsafe { CloseHandle(handle) };
+    result
+}
+
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
@@ -136,42 +192,9 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     crate::timeline::told("an event asked for", this as usize, value);
     if event.is_null() {
         #[cfg(windows)]
-        {
-            use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
-            use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-
-            // SAFETY: a private, initially unsignaled event.
-            let handle = match unsafe { CreateEventW(None, false, false, None) } {
-                Ok(handle) => handle,
-                Err(error) => return error.code().0,
-            };
-            waiters.push((value, handle.0 as usize));
-            drop(waiters);
-            // A queued signal may follow work that has not been submitted or settled yet.
-            crate::queue::before_sync();
-            crate::host::settle_for_fence();
-            let result = loop {
-                // SAFETY: this call owns the event until it unregisters the waiter.
-                match unsafe { WaitForSingleObject(handle, 10) } {
-                    WAIT_OBJECT_0 => break S_OK,
-                    WAIT_TIMEOUT => {
-                        // A direct write to the exposed fence word can also satisfy the wait.
-                        if fence.value.load(Ordering::Acquire) >= value {
-                            break S_OK;
-                        }
-                        crate::queue::release_held(false);
-                    }
-                    _ => break windows::core::Error::from_thread().code().0,
-                }
-            };
-            let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
-            waiters.retain(|&(_, pending)| pending != handle.0 as usize);
-            // SAFETY: no signal can still use this event after unregistering it.
-            let _ = unsafe { CloseHandle(handle) };
-            return result;
-        }
+        return wait_null_event(fence, value, waiters, NULL_EVENT_TIMEOUT);
         #[cfg(not(windows))]
-        return crate::object::E_NOTIMPL;
+        return E_NOTIMPL;
     }
     waiters.push((value, event as usize));
     S_OK
@@ -311,6 +334,27 @@ mod tests {
         assert_eq!(slot::<Flags>(queried, 0x58)(queried), 0x2);
         assert_eq!(slot::<Release>(queried, 0x10)(queried), 1);
         assert_eq!(slot::<Release>(f, 0x10)(f), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn null_event_times_out_and_unregisters_waiter() {
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let fence_obj = fence(f);
+        let waiters = fence_obj.waiters.lock().unwrap();
+        let hr = wait_null_event(
+            fence_obj,
+            9,
+            waiters,
+            std::time::Duration::from_millis(30),
+        );
+        assert_eq!(hr, E_NOTIMPL, "unreached blocking wait must time out");
+        assert!(
+            fence_obj.waiters.lock().unwrap().is_empty(),
+            "timed-out waiter must be unregistered"
+        );
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 
     #[cfg(windows)]
