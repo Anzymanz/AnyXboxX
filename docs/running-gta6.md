@@ -86,9 +86,11 @@ Measured on Linux only, with this code (built as `890a83a` before the copy, same
 
 The "community view-tree wineserver patch" above is [CachyOS/wine-cachyos#50](https://github.com/CachyOS/wine-cachyos/pull/50) (Wine bug [60868](https://bugs.winehq.org/show_bug.cgi?id=60868)), by ajsem1337 from a version by neonbyte1, discussed in Marvisak/VIctory#340 and #834. wineserver keeps each process's mapped views in a list and walks it on every map, unmap and address check; VIctory keeps tens of thousands of views alive in the world, and Wine's process-wide virtual memory lock is held across those server calls, so every `VirtualProtect`, write-watch query and guard fault on other threads waits too. The patch adds a tree keyed by view base. Only `wineserver` changes, and it must match the Proton it runs with (same server protocol).
 
-`tools/build_ge_wineserver.sh <GE tag> <installed GE-Proton folder> <empty work folder>` builds it for a GE-Proton release: it fetches that tag of proton-ge-custom and the Wine and wine-staging commits it pins, applies GE's Wine patches (the Wine section of its `protonprep-valve-staging.sh`), applies the patch, builds only `server/wineserver`, checks its protocol version against the installed Proton's `ntdll.so`, and makes a copy of the Proton folder with only `files/bin/wineserver` replaced. About 75 s on a 16-core CPU; needs git, a C toolchain, autoconf, flex, bison, perl and python3. Launch with that copy (`proton runinprefix ...`), and make sure no stock wineserver is still alive for the prefix: a new launch joins the running one.
+`tools/build_ge_wineserver.sh <GE tag> <installed GE-Proton folder> <empty work folder>` builds it for a GE-Proton release: it fetches the proton-ge-custom commit the script pins for that tag (only GE-Proton11-14 for now; another release needs its commit added to `ge_commit`) and the Wine and wine-staging commits that pins, applies GE's Wine patches (the Wine section of its `protonprep-valve-staging.sh`), applies the patch once its sha256 matches the pinned one, builds only `server/wineserver`, checks its protocol version against the installed Proton's `ntdll.so`, and makes a copy of the Proton folder with only `files/bin/wineserver` replaced. About 75 s on a 16-core CPU; needs git, a C toolchain, autoconf, flex, bison, perl and python3. Launch with that copy (`proton runinprefix ...`), and make sure no stock wineserver is still alive for the prefix: a new launch joins the running one.
 
-Measured with GE-Proton11-14 (protocol 938) on CachyOS, RX 9070 XT, Mesa 26.3.1, this repository's VIctory plus Marvisak/VIctory#454 (watchdog off), Wine's own `d3dcompiler_47` (so indirect draws were dropped in every run), same binary and prefix, only `wineserver` swapped:
+GE-Proton's own tree carries an equivalent fix since 27 Nov 2026 (proton-ge-custom `d3b6ae7`, `patches/wine-hotfixes/em-fixups/0078-server-store-process-views-in-an-rb-tree.patch`; GloriousEggroll/proton-ge-custom#1016 was closed as its duplicate). A GE-Proton release after GE-Proton11-14 that includes it needs no build: check its release notes.
+
+The numbers below were measured and are reported by this script's contributor; the project has not reproduced them. Measured with GE-Proton11-14 (protocol 938) on CachyOS, RX 9070 XT, Mesa 26.3.1, this repository's VIctory plus Marvisak/VIctory#454 (watchdog off), Wine's own `d3dcompiler_47` (so indirect draws were dropped in every run), same binary and prefix, only `wineserver` swapped:
 
 | | stock | view tree |
 | --- | ---: | ---: |
@@ -97,7 +99,7 @@ Measured with GE-Proton11-14 (protocol 938) on CachyOS, RX 9070 XT, Mesa 26.3.1,
 | wineserver CPU | 146 s over the 600 s run | about 0.07 of a core in the world (`perf`, 20 s) |
 | `MapViewOfFile` + `UnmapViewOfFile` pair, with 0 / 5,000 / 20,000 / 50,000 other views mapped | 42 / 174 / 139 / 314 µs | 46 / 54 / 42 / 59 µs |
 
-Both view-tree runs ended after about 8 and 7 minutes on the title's own breakpoint ("Unsignaled CrossQueueBarrier" in its crash report); the stock run did not get that far, so whether the patch is involved is not known yet.
+Both view-tree runs ended after about 8 and 7 minutes on the title's own breakpoint (a cross-queue barrier never signalled, by its crash report); the stock run did not get that far, so whether the patch is involved is not known yet.
 
 Settings of that run (not set by the launcher; Linux only):
 
