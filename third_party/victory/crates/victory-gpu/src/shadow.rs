@@ -3224,15 +3224,28 @@ mod stale_tests {
     }
 }
 
-/// Copies of windows outside buffers let go since the start, and their
-/// bytes.
-static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Copies of windows outside buffers let go since the start: how many, the
+/// title memory they spanned (their logical length, a window in place
+/// included), and of that the bytes of host copies they owned
+/// ([`copy_bytes`]; none for a window in place, which is the title's own
+/// memory). Neither says resident memory fell at once: a copy goes through
+/// `retire`.
+static LET_GO: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-/// For the memory line: the windows let go since the start and their
-/// bytes, and of the bytes of the windows alive, how many lie between the
-/// lowest and the highest address ever asked for in each.
+/// The windows a sweep lets go, as `(logical length, owned copy bytes)`
+/// each: how many, the span, and the owned bytes, for [`LET_GO`].
+fn let_go_tally(gone: impl Iterator<Item = (u64, u64)>) -> [u64; 3] {
+    gone.fold([0; 3], |[n, span, owned], (len, copy)| {
+        [n + 1, span.saturating_add(len), owned.saturating_add(copy)]
+    })
+}
+
+/// For the memory line: the windows let go since the start, the title
+/// memory they spanned and the host-copy bytes they owned ([`LET_GO`]), and
+/// of the bytes of the windows alive, how many lie between the lowest and
+/// the highest address ever asked for in each.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn windows() -> [u64; 3] {
+pub(crate) fn windows() -> [u64; 4] {
     let asked: u64 = {
         let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         loose
@@ -3244,7 +3257,12 @@ pub(crate) fn windows() -> [u64; 3] {
             })
             .sum()
     };
-    [LET_GO[0].load(Ordering::Relaxed), LET_GO[1].load(Ordering::Relaxed), asked]
+    [
+        LET_GO[0].load(Ordering::Relaxed),
+        LET_GO[1].load(Ordering::Relaxed),
+        LET_GO[2].load(Ordering::Relaxed),
+        asked,
+    ]
 }
 
 /// For the memory line, of the windows alive: the bytes of their pages
@@ -3413,14 +3431,19 @@ pub(crate) fn let_go_idle() {
         victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect()
     };
     if !gone.is_empty() {
-        let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
+        let [went, span, owned] = let_go_tally(gone.iter().map(|s| (s.len, copy_bytes(s))));
+        for (counter, value) in LET_GO.iter().zip([went, span, owned]) {
+            counter.fetch_add(value, Ordering::Relaxed);
+        }
         crate::host::trail(|| {
-            format!("sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
+            format!(
+                "sweep: {went} host copies of windows of title memory let go ({} KiB spanned, {} KiB of owned copies), held by no list and no slot",
+                span >> 10,
+                owned >> 10
+            )
         });
     }
     for shadow in gone {
-        LET_GO[0].fetch_add(1, Ordering::Relaxed);
-        LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
         // Nothing runs now and nothing names it: freed at once unless a
         // submission is running after all.
         crate::host::retire(shadow);
@@ -6073,7 +6096,7 @@ pub(crate) fn exact_line(frames: f64) {
 mod window_tests {
     use super::{
         WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of, window_victims,
+        let_go_tally, tail_of, window_of, window_victims,
     };
 
     #[test]
@@ -6149,6 +6172,19 @@ mod window_tests {
         assert_eq!(window_victims(&entries, 300 * M, 2_048 * M), vec![0, 2]);
         // Over the budget, the others go too, oldest first.
         assert_eq!(window_victims(&entries, 300 * M, 50 * M), vec![0, 1, 2]);
+    }
+
+    /// The sweep's tally keeps the window span and the owned copy bytes
+    /// apart: a window in place spans title memory but owns no copy.
+    #[test]
+    fn let_go_tally_keeps_span_and_owned_copy_bytes_apart() {
+        const M: u64 = 1 << 20;
+        // akimfomin's two-window case (#466): a 4 MiB window in place (no
+        // bytes of its own) and an 8 MiB allocated copy. The span is 12 MiB,
+        // the owned copies 8 MiB.
+        let gone = [(4 * M, 0), (8 * M, 8 * M)];
+        assert_eq!(let_go_tally(gone.into_iter()), [2, 12 * M, 8 * M]);
+        assert_eq!(let_go_tally(std::iter::empty()), [0, 0, 0]);
     }
 
     /// In place a copy holds no bytes of its own: it neither counts against
