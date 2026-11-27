@@ -30,7 +30,7 @@ records, geometry and dispatch dimensions with the instruction masked out.
 | --- | --- |
 | Static | 128 pre-uploaded 16- and 32-bit box and triangle nodes. Lanes in a group use the same node. |
 | Dynamic | The same 128 nodes alternate between two placements. A node-region copy and barrier precede each dispatch. Rays and pointers stay fixed. |
-| Heavy | 262,144 nodes. An odd stride permutes the node indices so adjacent lanes fetch distant nodes and run different node tests. |
+| Heavy | 262,144 node records tiled from the same geometry. An odd stride permutes the node indices so adjacent lanes fetch distant nodes and run different node tests. |
 
 Each geometry phase is read back in separate verification frames with RT on
 and off. The CPU reference in `victory-shader/src/bvh.rs` computes the four

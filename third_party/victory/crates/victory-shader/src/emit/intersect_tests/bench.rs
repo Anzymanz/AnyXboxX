@@ -54,7 +54,7 @@ impl Workload {
 }
 
 fn node_y(node: u32) -> f32 {
-    ((node / 8) % 64) as f32 * 4.0
+    ((node % COHERENT_NODES) / 8) as f32 * 4.0
 }
 
 fn node_kind(node: u32) -> u32 {
@@ -67,7 +67,8 @@ fn node_kind(node: u32) -> u32 {
 
 fn geometry(count: u32, offset_y: f32) -> Scene {
     let mut scene = Scene::new();
-    for node in 0..count {
+    let palette = count.min(COHERENT_NODES);
+    for node in 0..palette {
         let x = 8.0 * ((node % 11) + 1) as f32;
         let y = node_y(node) + offset_y;
         let bounds = [12.0, 0.0, 8.0, 4.0].map(|dx| {
@@ -82,6 +83,18 @@ fn geometry(count: u32, offset_y: f32) -> Scene {
                 16,
             ),
         };
+    }
+    // Keep the exhaustive half-float fixture encoder out of the large loop.
+    // The heavy scene still has a distinct buffer offset for every node.
+    let palette_words = scene.words.len();
+    let palette_starts = scene.starts.clone();
+    for tile in 1..(count / palette) as usize {
+        scene.words.extend_from_within(..palette_words);
+        scene.starts.extend(
+            palette_starts
+                .iter()
+                .map(|start| tile * palette_words + start),
+        );
     }
     scene
 }
@@ -329,7 +342,7 @@ fn synthetic_rt_writes_distinct_groups_and_uses_the_rt_switch() {
         .expect("SM 6.6 adapter");
     let shader = shader();
     for workload in [Workload::Dynamic, Workload::Heavy] {
-        run(&host, &shader, &Fixture::new(workload, 4 * THREADS), 0, 0);
+        run(&host, &shader, &Fixture::new(workload, 8 * THREADS), 0, 0);
     }
 }
 
