@@ -47,6 +47,11 @@ struct Arena {
 }
 
 static ARENAS: Mutex<Vec<Arena>> = Mutex::new(Vec::new());
+/// Serializes slow-path arena growth so simultaneous cold-start misses share
+/// one newly committed 4 MiB arena instead of each reserving its own, while
+/// keeping `VirtualAlloc2`, `shadow::register`, and `write_bytes` outside
+/// `ARENAS`.
+static ARENA_GROW: Mutex<()> = Mutex::new(());
 
 /// Upload memory of one request, zeroed, given back when dropped.
 pub(crate) struct Upload(Kind);
@@ -107,6 +112,23 @@ pub(crate) fn reserve(len: usize) -> Option<usize> {
     (at != 0).then_some(at)
 }
 
+/// Reserves `n` contiguous free blocks from an existing arena under `ARENAS`.
+fn try_take(arenas: &mut [Arena], n: usize, count: u32) -> Option<usize> {
+    arenas.iter_mut().find_map(|arena| {
+        if arena.free < n {
+            return None;
+        }
+        let first = gap(&arena.slots, n)?;
+        let span = Slot {
+            first: u32::try_from(first).ok()?,
+            count,
+        };
+        arena.slots[first..first + n].fill(span);
+        arena.free -= n;
+        Some(arena.at + first * BLOCK)
+    })
+}
+
 impl Upload {
     pub(crate) fn new(len: usize) -> Option<Upload> {
         if !low() {
@@ -116,19 +138,7 @@ impl Upload {
         let count = u32::try_from(n).ok()?;
         let reused = {
             let mut arenas = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
-            arenas.iter_mut().find_map(|arena| {
-                if arena.free < n {
-                    return None;
-                }
-                let first = gap(&arena.slots, n)?;
-                let span = Slot {
-                    first: u32::try_from(first).ok()?,
-                    count,
-                };
-                arena.slots[first..first + n].fill(span);
-                arena.free -= n;
-                Some(arena.at + first * BLOCK)
-            })
+            try_take(&mut arenas, n, count)
         };
         if let Some(at) = reused {
             // Reused blocks are exclusively owned now; zero outside `ARENAS` so
@@ -137,8 +147,19 @@ impl Upload {
             unsafe { std::ptr::write_bytes(at as *mut u8, 0, len) };
             return Some(Upload(Kind::Low(at, len)));
         }
-        // Reserve and register outside `ARENAS` to avoid lock nesting with
-        // `shadow::register` and stalling other threads behind `VirtualAlloc2`.
+        // Serialize slow-path growth so simultaneous misses share one new arena,
+        // while still keeping `VirtualAlloc2` and `shadow::register` outside `ARENAS`.
+        let _grow = ARENA_GROW.lock().unwrap_or_else(|e| e.into_inner());
+        let reused_after_wait = {
+            let mut arenas = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
+            try_take(&mut arenas, n, count)
+        };
+        if let Some(at) = reused_after_wait {
+            drop(_grow);
+            // SAFETY: the blocks are ours and nobody else holds them.
+            unsafe { std::ptr::write_bytes(at as *mut u8, 0, len) };
+            return Some(Upload(Kind::Low(at, len)));
+        }
         let blocks = n.max(ARENA / BLOCK);
         let bytes = blocks.checked_mul(BLOCK)?;
         let at = reserve(bytes)?;
@@ -152,6 +173,7 @@ impl Upload {
             free: blocks - n,
         };
         ARENAS.lock().unwrap_or_else(|e| e.into_inner()).push(arena);
+        drop(_grow);
         // Fresh `VirtualAlloc2(MEM_COMMIT)` pages are already zero-filled; skip
         // `write_bytes` so untouched pages are not prematurely dirtied in WriteWatch.
         Some(Upload(Kind::Low(at, len)))
@@ -246,5 +268,43 @@ mod tests {
         assert_eq!(gap(&[used, free, used, free, free, used], 1), Some(1));
         assert_eq!(gap(&[used, free, used, free, free, used], 2), Some(3));
         assert_eq!(gap(&[used, free, used, free, free, used], 3), None);
+    }
+
+    #[test]
+    fn cold_parallel_uploads_share_a_single_arena() {
+        const CHILD: &str = "VICTORY_TEST_COLD_PARALLEL_UPLOADS";
+        const TEST_NAME: &str = "upload::tests::cold_parallel_uploads_share_a_single_arena";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([TEST_NAME, "--exact", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("VICTORY_UPLOAD_LOW", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "cold parallel upload child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        const WORKERS: usize = 16;
+        let start = std::sync::Barrier::new(WORKERS);
+        let live = std::sync::Barrier::new(WORKERS);
+        std::thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                scope.spawn(|| {
+                    start.wait();
+                    let upload = Upload::new(128).expect("low upload");
+                    live.wait();
+                    drop(upload);
+                });
+            }
+        });
+        assert_eq!(
+            ARENAS.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "16 simultaneous cold-start uploads must share one 4 MiB arena"
+        );
     }
 }
