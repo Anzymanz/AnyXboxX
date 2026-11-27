@@ -1967,7 +1967,7 @@ impl<'a> Lower<'a> {
                         }
                     }
                 }
-                // `VICTORY_WAVE_WHY=1`: why a program keeps 64-lane waves (one line per reason)
+                // `VICTORY_WAVE_WHY=1`: diagnostic-only (excluded from shader cache key in build.rs).
                 if wave == 64 && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
                     let mut why: Vec<&str> = Vec::new();
                     for i in insts() {
@@ -2179,6 +2179,7 @@ impl<'a> Lower<'a> {
             },
             own_bits: match &exchange {
                 Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() => {
+                    // `VICTORY_WAVE_WHY` must stay diagnostic-only (excluded from shader cache key in build.rs).
                     super::own_bits::find(p, x.st, std::env::var_os("VICTORY_WAVE_WHY").is_some())
                 }
                 _ => Default::default(),
@@ -7359,6 +7360,7 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
+            // `VICTORY_DESC_WHY` must stay diagnostic-only (excluded from shader cache key in build.rs).
             if std::env::var_os("VICTORY_DESC_WHY").is_some() {
                 eprintln!(
                     "DESC-WHY {:#x} {} scalar={:?} lane_copied={}",
