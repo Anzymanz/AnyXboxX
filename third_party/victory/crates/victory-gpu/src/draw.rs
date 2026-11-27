@@ -4861,8 +4861,20 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            // The depth target the draw only tests is read in both ways at
+            // once: both read states, which its preparation asks for too.
+            let (tested, _) = TESTED_DEPTH.get();
+            let state = if tested != 0 && tested == *resource {
+                TESTED_DEPTH.set((tested, true));
+                DEPTH_READ | SHADER_RESOURCE
+            } else {
+                SHADER_RESOURCE
+            };
             // One lookup of the host copy (and twin) for the upload, the
             // twin and the state: each lookup takes the texture's lock.
+            // Without a host side (a buffer, or a texture the host refused
+            // to make: `resource::hosted` says no again each time) there is
+            // nothing to upload, pair or move, as before.
             let Some((copy, twin)) = crate::resource::host_side(*resource as This) else {
                 return;
             };
@@ -4880,22 +4892,11 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             if let Some(twin) = &twin {
                 list.twin_use_held(&copy, twin, false, false);
             }
-            // The depth target the draw only tests is read in both ways at
-            // once: both read states, which its preparation asks for too.
-            let (tested, _) = TESTED_DEPTH.get();
-            let state = if tested != 0 && tested == *resource {
-                TESTED_DEPTH.set((tested, true));
-                DEPTH_READ | SHADER_RESOURCE
-            } else {
-                SHADER_RESOURCE
-            };
             crate::list::ensure_held_state(list, &copy, state);
             #[cfg(feature = "diagnostics")]
-            if tracing::enabled!(tracing::Level::DEBUG)
-                && let Some(t) = crate::resource::host_resource(*resource as This)
-            {
+            if tracing::enabled!(tracing::Level::DEBUG) {
                 // SAFETY: a live resource.
-                let d = unsafe { t.GetDesc() };
+                let d = unsafe { copy.texture.GetDesc() };
                 if d.Flags.0 & 7 == 0 {
                     tracing::debug!(
                         resource = format_args!("{resource:#x}"),
