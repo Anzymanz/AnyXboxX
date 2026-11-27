@@ -2,7 +2,6 @@
 import ctypes
 import os
 
-
 from test_runtime_cpp import GdkInterface, S_OK, anyxboxx_only
 
 pytestmark = anyxboxx_only

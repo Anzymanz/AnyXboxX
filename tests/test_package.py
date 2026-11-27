@@ -8,7 +8,6 @@ import pytest
 
 from test_runtime_cpp import S_OK, THREAD_POOL, AsyncBlock, GdkInterface, TaskQueueApi, anyxboxx_only
 
-PACKAGE = ("AF406016-E850-4AA8-A88D-2F3DCB9DAC7E", "0B9D556E-E9C4-4F3B-A5D6-5A2CBAB7BB2A")
 P = ctypes.c_void_p
 PP = ctypes.POINTER(ctypes.c_void_p)
 
