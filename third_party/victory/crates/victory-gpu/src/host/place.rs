@@ -38,6 +38,9 @@
 use super::*;
 use crate::shadow::Shadow;
 
+mod forward;
+pub(super) use forward::{FORWARDED, fill_after_copy, forward};
+
 pub(super) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_COPIES_IN_PLACE").is_none_or(|v| v != "0"))

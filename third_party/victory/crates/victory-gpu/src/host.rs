@@ -2351,6 +2351,8 @@ enum Step {
     /// A copy of title memory into the list's own upload memory, and how
     /// the card could bring the bytes instead.
     Fill(usize, usize, usize, Option<card_steps::FillTo>),
+    /// A fill from an earlier placed copy's upload memory (destination, source, bytes).
+    ForwardedFill(usize, usize, usize),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
@@ -3182,7 +3184,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 },
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
+                Step::ForwardedFill(..) | Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
             }
         }
     }
@@ -3928,6 +3930,10 @@ fn late_line(frames: f64) {
             t[2],
             t[3],
         );
+    }
+    if place::fill_after_copy() {
+        let fills = place::FORWARDED.swap(0, Ordering::Relaxed) as f64 / frames;
+        tracing::info!("fills forwarded from placed copies per frame (VICTORY_FILL_AFTER_COPY): {fills:.1}");
     }
     card_steps::log(frames);
     crate::port::log(frames);
@@ -7264,9 +7270,7 @@ impl HostList {
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len, None));
+        self.defer_upload_fill(dst, src, len, None);
     }
 
     /// The host address of `len` bytes of scratch memory that hold the title
@@ -7287,16 +7291,25 @@ impl HostList {
     /// As [`HostList::defer_fill`], for upload memory that only `slot` (a
     /// title heap's address, and the slot) shows.
     pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
+        self.defer_upload_fill(dst, src, len, Some(card_steps::FillTo::Slot(slot.0, slot.1)));
     }
 
     /// As [`HostList::defer_fill`], for the beginning of a buffer
     /// [`HostList::upload`] made.
     pub(crate) fn defer_fill_buffer(&self, buffer: &ID3D12Resource, dst: *mut u8, src: *const u8, len: usize) {
         let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone()));
-        self.deferred().copies.push(Step::Fill(dst as usize, src as usize, len, to));
+        self.defer_upload_fill(dst, src, len, to);
+    }
+
+    fn defer_upload_fill(&self, dst: *mut u8, src: *const u8, len: usize, to: Option<card_steps::FillTo>) {
+        let mut deferred = self.deferred();
+        let (dst, src) = (dst as usize, src as usize);
+        let step = if let Some(upload) = place::forward(&deferred.copies, src, len) {
+            Step::ForwardedFill(dst, upload, len)
+        } else {
+            Step::Fill(dst, src, len, to)
+        };
+        deferred.copies.push(step);
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -7332,6 +7345,10 @@ impl HostList {
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.gpu_written.insert(key) || !declare_once() {
             deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+            if place::fill_after_copy() {
+                // A previous scratch fill may have forwarded over this range.
+                deferred.filled.clear();
+            }
         }
     }
 
@@ -7759,6 +7776,18 @@ impl HostList {
                     }
                     let started = std::time::Instant::now();
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    (started, len)
+                }
+                &Step::ForwardedFill(dst, upload, len) => {
+                    let started = std::time::Instant::now();
+                    // Preserve fill order and read the upload prepared by the earlier Placed step.
+                    batch.fill();
+                    copy_mapped(dst as *mut u8, upload as *const u8, len, false);
+                    place::FORWARDED.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        copies += 1;
+                    }
                     (started, len)
                 }
                 Step::Placed(p) => {
