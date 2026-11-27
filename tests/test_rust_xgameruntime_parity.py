@@ -28,10 +28,10 @@ def interface_matrix(folder):
     tables = (ROOT / "runtime/xgameruntime/served_interfaces.inc").read_text(encoding="utf-8")
     entries = re.findall(r'^ANYXBOXX_SERVED_INTERFACE\((\w+), "([^"]+)", "([^"]+)"\)', tables, re.M)
     gdk_table = (ROOT / "runtime/xgameruntime/gdk_api_table.inc").read_text(encoding="utf-8")
-    slots = re.findall(r'^ANYXBOXX_GDK_API\(\w+, "([^"]+)", "([^"]+)", (\d+)\)', gdk_table, re.M)
+    slots = re.findall(r'^ANYXBOXX_GDK_API\((\w+), "([^"]+)", "([^"]+)", (\d+)\)', gdk_table, re.M)
     owners = {(p, i): name for name, p, i in entries}
     lengths = {}
-    for provider, iid, slot in slots:
+    for _, provider, iid, slot in slots:
         name = owners.get((provider, iid))
         if name:
             lengths[name] = max(lengths.get(name, 0), int(slot) + 1)
@@ -55,6 +55,14 @@ def interface_matrix(folder):
                     and (name, n) != ("TaskQueueInterface", 8)])
         rows.append(row)
     assert len(rows) == 26 and len(set(addresses.values())) == len(addresses)
+    by_pair = {(p, i): row[-1] for (_, p, i), row in zip(entries, rows, strict=True)}
+    refused = {api for api, p, i, slot in slots if int(slot) in by_pair.get((p, i), ())}
+    # These handlers have their own ABI or diagnostics. They do not implement the service.
+    refused.update(api for api, _, _, _ in slots if api.startswith("XUserGetTokenAndSignature"))
+    refused.update({"XLaunchNewGame", "XLaunchUri", "XPersistentLocalStorageMountForPackage",
+                    "XPackageUninstallChunks", "XPackageUninstallUWPInstance", "XPackageUninstallPackage"})
+    inventory = (ROOT / "runtime/xgameruntime/unsupported.txt").read_text(encoding="utf-8").splitlines()
+    assert sorted(refused) == inventory
     return rows
 
 
