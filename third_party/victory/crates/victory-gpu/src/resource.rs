@@ -2771,10 +2771,10 @@ fn host_texture_as(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
-    // A texture the title fills, whose every subresource is uploaded before
-    // anything reads it: cut from a block (what the piece held before shows
-    // in no texel).
-    if fills(desc)
+    // A pooled copy has heap memory already. A levels-on-demand texture
+    // needs a reserved resource whose heap tiles can be assigned later.
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -3673,6 +3673,34 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn levels_on_demand_can_reserve_a_texture_that_also_fits_the_pool() {
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        let Some(host) = crate::host::host() else { return; };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: the D3D12 options query fills the matching structure.
+        let supports_tiles = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }.is_ok() && options.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_2.0;
+        if !supports_tiles {
+            return;
+        }
+
+        let desc = texture(512, 512, 28, 10);
+        assert!(texture_layout(&desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor()));
+        let copy = host_texture_as(&desc, 0, std::ptr::null(), true).expect("reserved texture");
+        assert!(
+            crate::tiles::Tiled::make(&host.device, &copy, u32::from(desc.mip_levels)).is_some(),
+            "the requested texture must be backed by tiles chosen at upload time",
+        );
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {
