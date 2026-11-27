@@ -1,0 +1,124 @@
+# Launch profiles of the graphical launcher, embedded in the binary (include_str!).
+#
+# Each [[profile]] applies to a host (os: "windows", "linux" = Proton or Wine, or "any") and a GPU
+# vendor (gpu: "nvidia", "amd", "intel", "any"). The most specific match wins: a profile naming both
+# fields beats one naming one, which beats the "any" fallback; a tie goes to the first one listed.
+#
+# status:
+#   "measured"   values measured by the maintainer or a contributor on the stated setup (see note);
+#   "unmeasured" VIctory's own defaults, nothing measured with this profile.
+# Overrides typed in the launcher's advanced panel always win over [profile.env].
+#
+# Every variable named here is read by third_party/victory (checked by the launcher's tests). Values "0"
+# turn the switch off, as VIctory reads them.
+
+# ---------------------------------------------------------------------------------------------
+# Windows + NVIDIA: the default set of `anyxboxx run` and of main's tools/lancer_victory.ps1 (the golden
+# copy is tests/fixtures/lancer_victory_vicetay.ps1): Vice-Tay's scripts/play.ps1 -Machine 4070 (RTX 4070 /
+# 8-core profile), windowed, no panel. The launcher's base adds VICTORY_GAME_DIR and VICTORY_DISCORD=0; a
+# test checks this table against anyxboxx::run::TUNED.
+#
+# Measured by the maintainer on 2026-11-26 (RTX 4070 SUPER, i7-13700KF, Series X, warm cache): median about
+# 20 fps in the world, against 14.2 for the Neptune set. VICTORY_D3D12_DRED=light keeps the lists without
+# markers; it is part of the measured set (the launcher's DRED option still sets the full mode over it).
+# ---------------------------------------------------------------------------------------------
+[[profile]]
+id = "windows-nvidia"
+name = "Windows + NVIDIA (Fast, measured set)"
+os = "windows"
+gpu = "nvidia"
+status = "measured"
+note = "Vice-Tay base (play.ps1 -Machine 4070), 2026-11-26 measurement: median about 20 fps in the world on an RTX 4070 SUPER."
+
+[profile.env]
+VICTORY_TEXTURE_NO_WAIT = "1"
+VICTORY_RELAY = "2"
+VICTORY_WIDE_BACK = "1"
+VICTORY_CARD_REHASH_RUNS = "1"
+VICTORY_JOIN_COPIES = "1"
+VICTORY_INDIRECT_WINDOW = "1"
+VICTORY_RELAY_COPY = "1"
+VICTORY_CARD_STEPS = "2"
+VICTORY_TITLE_PRIORITIES = "0"
+VICTORY_SHOW_AFTER = "1"
+VICTORY_AMBIENT = "0.8"
+VICTORY_D3D12_DRED = "light"
+VICTORY_WAVE_WIDE_ONLY = "6f225b641c5b0708,5dc3b25986622949,369cbe906ea72764,2cc4c197ee29e291"
+VICTORY_THIN_THREADS = "8"
+VICTORY_UNDER_THREADS = "6"
+VICTORY_LAND_THREADS = "4"
+VICTORY_MAP_THREADS = "1"
+VICTORY_PIPELINE_WORKERS = "3"
+VICTORY_CARD_RESERVE_BUDGETS = "1"
+VICTORY_CARD_BUFFERS_MIN_KB = "64"
+VICTORY_CARD_BUFFERS_MB = "1536"
+VICTORY_CARD_WINDOWS_MB = "1024"
+VICTORY_THIN = "1"
+VICTORY_JOIN_PARTS = "8"
+VICTORY_UPLOAD_AHEAD = "1"
+VICTORY_INDIRECT_BATCH = "2"
+
+# ---------------------------------------------------------------------------------------------
+# Linux (Proton) + AMD: the settings of PR #199's measured Linux run (Exorion1er, Fedora 44,
+# RX 9070 XT 16 GB, RADV through vkd3d-proton, GE-Proton11-12, about 3.7 fps on the title).
+# Deliberately not included: VICTORY_SKIP_PIPELINES (a list of nine shader hashes of that run,
+# for that build only: type it in the advanced panel if you want it) and VICTORY_L7_SKIP (needs
+# a local role table, VICTORY_L7_ROLES). VICTORY_DSTORAGE_NOTIFY is not in that run's list.
+# The PR #199 switches stay at VIctory's defaults (on) in this profile.
+# ---------------------------------------------------------------------------------------------
+[[profile]]
+id = "linux-amd"
+name = "Linux (Proton) + AMD"
+os = "linux"
+gpu = "amd"
+status = "measured"
+note = "PR #199 measured on Linux only (RADV, 16 GB card). Not measured on Windows with these commits."
+
+[profile.env]
+VICTORY_SHADER_LOOP_LIMIT = "256"
+# With late waits the device is lost on RADV (fork issue #184).
+VICTORY_LATE_WAIT = "0"
+VICTORY_WIDE_BACK = "0"
+# Host pipeline wait per frame, in milliseconds.
+VICTORY_PIPELINE_WAIT_MS = "50"
+# Texture budget for a 16 GB card.
+VICTORY_TEXTURE_BUDGET_MB = "8192"
+# Texture refreshes do not wait for title memory.
+VICTORY_TEXTURE_NO_WAIT = "1"
+VICTORY_CARD_BUFFERS_MIN_MB = "1"
+VICTORY_CARD_BUFFERS_MB = "1024"
+# The title asks for 1,245,184 views, more than vkd3d-proton's default cap.
+VKD3D_CONFIG = "descriptor_heap"
+
+# ---------------------------------------------------------------------------------------------
+# Fallbacks: VIctory's own defaults (empty set), nothing measured with these hosts.
+# ---------------------------------------------------------------------------------------------
+[[profile]]
+id = "windows-amd"
+name = "Windows + AMD"
+os = "windows"
+gpu = "amd"
+status = "unmeasured"
+note = "VIctory's defaults: no tuned settings have been measured on this host."
+
+[profile.env]
+
+[[profile]]
+id = "intel"
+name = "Intel GPU"
+os = "any"
+gpu = "intel"
+status = "unmeasured"
+note = "VIctory's defaults: no tuned settings have been measured on Intel."
+
+[profile.env]
+
+[[profile]]
+id = "other"
+name = "Other host or GPU"
+os = "any"
+gpu = "any"
+status = "unmeasured"
+note = "VIctory's defaults: nothing is set. Use the advanced panel to try settings yourself."
+
+[profile.env]

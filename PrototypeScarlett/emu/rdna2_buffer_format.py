@@ -15,17 +15,20 @@ ac_translate_buffer_dataformat : R10G10B10A2 → 2_10_10_10, R11G11B10_FLOAT →
 Conversions en lecture (valeur 32 bits écrite dans le VGPR) :
 - UNORM sur n bits : c / (2^n - 1) ; SNORM : max(c / (2^(n-1) - 1), -1), donc -2^(n-1) donne -1
   (spécification Vulkan, « Fixed-Point Data Conversions »). Arrondi au plus proche du quotient
-  exact (mesuré sur Radeon RX 6700 par Leonida, third_party/leonida/rdna2spirv.py, decode_format) ;
-  le quotient n'est jamais à mi-chemin de deux float32 : son écriture binaire se répète sans fin.
+  exact (supposé, non mesuré : Vulkan admet un écart) ; le quotient n'est jamais à mi-chemin de deux
+  float32 : son écriture binaire se répète sans fin.
 - USCALED, SSCALED : l'entier converti en float32, exact (16 bits au plus) ; UINT : étendu par des
-  zéros ; SINT : étendu par le signe (Leonida, mesuré sur gfx1036).
+  zéros ; SINT : étendu par le signe (XML d'AMD : « convert the data to 32 bit integral » ; ISA,
+  section 8.1.4, p. 59 : « Control over int vs. float is controlled by FORMAT »).
 - FLOAT 32 bits : les bits tels quels ; FLOAT 16 bits : élargissement exact en float32 (dénormaux
-  compris) ; un NaN garde signe et charge utile décalée, sans bit « quiet » ajouté (Leonida, mesuré
-  sur gfx1036, formats 13, 29 et 71).
+  compris) ; un NaN garde signe et charge utile décalée, sans bit « quiet » ajouté (supposé,
+  non mesuré).
 Écriture : seulement les formats UINT et SINT (sur 8, 16, 10, 11, 2 et 32 bits) et FLOAT 32 bits.
-UINT sature la valeur 32 bits à 2^n - 1, SINT la borne à [-2^(n-1), 2^(n-1) - 1] (Leonida, mesuré
-sur gfx1036). Les écritures UNORM, SNORM, SCALED et FLOAT 16 bits (arrondi non vérifié ici) et
+UINT sature la valeur 32 bits à 2^n - 1, SINT la borne à [-2^(n-1), 2^(n-1) - 1] (supposé, non
+mesuré). Les écritures UNORM, SNORM, SCALED et FLOAT 16 bits (arrondi non vérifié ici) et
 les formats flottants 11/10 bits (10_11_11_FLOAT, 11_11_10_FLOAT) sont refusés en les nommant.
+
+The _d16 forms (16 bits per component) narrow and widen these values: emu/rdna2_buffer_d16.py.
 """
 import re
 from typing import NamedTuple
@@ -51,7 +54,7 @@ DWORD_BITS = 32
 # Champs de l'instruction (MUBUFe_gfx10 et MTBUFe_gfx10 de LLVM, BUFInstructions.td).
 OFFSET_MASK, OFFEN_BIT, IDXEN_BIT, MUBUF_LDS_BIT = 0xFFF, 12, 13, 16
 MTBUF_FORMAT_SHIFT, TFE_BIT = 19, 55
-PATTERN = re.compile(r"^(t?)buffer_(load|store)_format_(x|xy|xyz|xyzw)$")
+PATTERN = re.compile(r"^(t?)buffer_(load|store)_format_(d16_)?(hi_)?(x|xy|xyz|xyzw)$")
 
 
 class FormatError(ValueError):
@@ -74,6 +77,16 @@ class Format(NamedTuple):
     def storable(self):
         return self.kind in INTEGER_KINDS or (self.kind == FLOAT and set(self.widths) == {DWORD_BITS})
 
+    @property
+    def d16_loadable(self):
+        """d16 load: 32-bit integer formats refused (truncated or clamped to 16 bits: not documented)."""
+        return not (self.kind in INTEGER_KINDS and self.widths[0] == DWORD_BITS)
+
+    @property
+    def d16_storable(self):
+        """d16 store: integer and FLOAT formats (float16 → float32 is exact, a 16-bit FLOAT field is copied)."""
+        return self.kind in INTEGER_KINDS or self.kind == FLOAT
+
 
 def _parse(code, full_name):
     found = NAME_PATTERN.match(full_name)
@@ -92,12 +105,15 @@ FORMATS = {code: found for code, name in rdna2_image.FORMAT_NAMES.items() if cod
            for found in [_parse(code, name)] if found is not None}
 
 
-def format_for(code, store):
-    """Format pris en charge (FormatError sinon), pour une lecture ou une écriture."""
+def format_for(code, store, d16=False):
+    """Format pris en charge (FormatError sinon), pour une lecture ou une écriture (d16 : 16 bits par composante)."""
     found = FORMATS.get(code)
     if found is None:
         raise FormatError(f"format {rdna2_image.FORMAT_NAMES.get(code, code)} non pris en charge")
-    if store and not found.storable:
+    if d16 and not (found.d16_storable if store else found.d16_loadable):
+        raise FormatError(f"d16 {'store' if store else 'load'} with format {found.name} not supported "
+                          "(16-bit conversion not documented)")
+    if store and not d16 and not found.storable:
         raise FormatError(f"écriture au format {found.name} non prise en charge (conversion non vérifiée)")
     return found
 
@@ -116,6 +132,8 @@ class Access(NamedTuple):
     srsrc: int          # premier SGPR du V#
     soffset: int
     fixed: int          # format de l'instruction (MTBUF), sinon None
+    d16: bool = False   # 16 bits par composante, deux par VGPR (emu/rdna2_buffer_d16.py)
+    high: bool = False  # _d16_hi_x : moitié haute du VGPR
 
 
 def supports(name):
@@ -131,9 +149,9 @@ def access(name, word):
     if word >> TFE_BIT & 1:
         raise FormatError(f"{name} avec tfe non pris en charge")
     fixed = (word >> MTBUF_FORMAT_SHIFT) & FORMAT_MASK if typed else None
-    return Access(typed, found.group(2) == "store", len(found.group(3)), word & OFFSET_MASK,
+    return Access(typed, found.group(2) == "store", len(found.group(5)), word & OFFSET_MASK,
                   word >> OFFEN_BIT & 1, word >> IDXEN_BIT & 1, (word >> 32) & 0xFF, (word >> 40) & 0xFF,
-                  ((word >> 48) & 0x1F) * 4, (word >> 56) & 0xFF, fixed)
+                  ((word >> 48) & 0x1F) * 4, (word >> 56) & 0xFF, fixed, bool(found.group(3)), bool(found.group(4)))
 
 
 # --- Descripteur V# ----------------------------------------------------------------------
@@ -159,8 +177,9 @@ def check_load_selects(fmt, word3, count):
 
 def store_selects_ok(fmt, word3):
     """MUBUF : écriture acceptée si DST_SEL nomme X, Y, Z, W dans l'ordre pour les composantes du
-    format, avec DST_SEL_Z constant (0 ou 1) pour un format à deux composantes : Leonida mesure sur
-    gfx1036 que DST_SEL_Z = Z ou W y change les composantes écrites (XYZW écrit x et w)."""
+    format, avec DST_SEL_Z constant (0 ou 1) pour un format à deux composantes. L'ISA (section 8.1.4,
+    table 31, p. 59) dit seulement que BUFFER_STORE_FORMAT_* prend DST_SEL du V# ; ce que DST_SEL_Z = Z
+    ou W change à une écriture de deux composantes n'est pas documenté : ces V# sont refusés."""
     found = selects(word3)
     if any(found[i] != SELECT_X + i for i in range(fmt.count)):
         return False
@@ -225,18 +244,25 @@ def _component(fmt, field, width):
     return field                                # UINT, FLOAT 32 bits
 
 
+def fields(fmt, data):
+    """(champ, largeur) de chaque composante d'un élément de `fmt.size` octets."""
+    packed, position, found = int.from_bytes(data, "little"), 0, []
+    for width in fmt.widths:
+        found.append(((packed >> position) & ((1 << width) - 1), width))
+        position += width
+    return found
+
+
 def decode(fmt, data):
     """Composantes (valeurs 32 bits) d'un élément de `fmt.size` octets."""
-    packed, position, values = int.from_bytes(data, "little"), 0, []
-    for width in fmt.widths:
-        values.append(_component(fmt, (packed >> position) & ((1 << width) - 1), width))
-        position += width
-    return values
+    return [_component(fmt, field, width) for field, width in fields(fmt, data)]
 
 
 def _field(fmt, value, width):
     if width == DWORD_BITS:
         return value
+    if fmt.kind == FLOAT:                       # float16 d'une écriture d16 (emu/rdna2_buffer_d16.py)
+        return value & ((1 << width) - 1)
     if fmt.kind == UINT:
         return min(value, (1 << width) - 1)
     low, high = -(1 << (width - 1)), (1 << (width - 1)) - 1
@@ -253,6 +279,7 @@ def encode(fmt, values):
 
 
 def select_one(fmt):
-    """Valeur de DST_SEL = 1 : 1.0 pour les formats flottants, normalisés et SCALED, 1 sinon (Leonida,
-    mesuré sur gfx1036 pour les 128 valeurs de FORMAT)."""
+    """Valeur de DST_SEL = 1 : 1.0 pour les formats flottants, normalisés et SCALED, 1 sinon. L'ISA
+    (section 8.1.5, p. 62, note 1) dit seulement que SEL_1 donne « 1 » ; 1.0 contre l'entier 1 selon le
+    type du format est supposé, non mesuré."""
     return ONE_INTEGER if fmt.kind in INTEGER_KINDS else ONE_FLOAT

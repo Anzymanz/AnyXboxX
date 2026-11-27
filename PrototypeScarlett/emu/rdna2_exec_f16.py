@@ -36,6 +36,26 @@ def _is_nan(bits):
     return bits & 0x7FFF > HALF_INFINITY
 
 
+ALMOST_ONE = 0x3BFF                          # plus grand f16 sous 1.0
+
+
+def half_fract(bits):
+    """v_fract_f16 : S0 + -floor(S0) (ISA), au plus 0x3BFF comme v_fract_f32 ; NaN pour ±infini et NaN."""
+    if _is_nan(bits) or bits & 0x7FFF == HALF_INFINITY:
+        return HALF_NAN
+    value = bits_half(bits)
+    return half_bits(min(value - math.copysign(math.floor(value), value), bits_half(ALMOST_ONE)))
+
+
+def half_frexp(bits):
+    """(mantisse f16, exposant) de S0 = m × 2^e, 0.5 ≤ |m| < 1 (dénormaux normalisés) ; ±0, ±infini et NaN :
+    S0 tel quel et exposant 0, comme v_frexp_*_f32."""
+    if bits & 0x7FFF == 0 or bits & 0x7FFF >= HALF_INFINITY:
+        return bits, 0
+    mantissa, exponent = math.frexp(bits_half(bits))
+    return half_bits(mantissa), exponent
+
+
 def _order(bits):
     """Clé qui croît avec la valeur (NaN exclus), -0 juste sous +0."""
     return ~bits & 0xFFFF if bits & 0x8000 else bits | 0x8000
@@ -65,6 +85,128 @@ def half_clamp(bits):
     return min(bits, HALF_ONE)
 
 
+def half_round(bits, function):
+    """v_floor/ceil/trunc/rndne_f16 : entier de S0 (exact en f16), signe gardé comme les formes f32
+    (IEEE 754 roundToIntegral : trunc(-0.5) = -0) ; ±infini inchangé, NaN → 0x7E00."""
+    if _is_nan(bits):
+        return HALF_NAN
+    if bits & 0x7FFF == HALF_INFINITY:
+        return bits
+    value = bits_half(bits)
+    return half_bits(math.copysign(float(function(value)), value))
+def half_toward_zero(value):
+    """Bits binary16 de `value` arrondi vers zéro : l'arrondi au plus proche, reculé d'un pas s'il s'éloigne
+    de zéro ; un fini trop grand donne ±65504, jamais l'infini ; NaN → 0x7E00."""
+    if math.isnan(value) or math.isinf(value):
+        return half_bits(value)
+    bits = half_bits(value)
+    return bits - 1 if abs(bits_half(bits)) > abs(value) else bits
+
+
+def half_rcp(bits):
+    """v_rcp_f16 (ISA RDNA 2, §12.8, VOP1 84, p. 147) : 1.0 / S0.f16 selon IEEE (±0 → ±inf, ±inf → ±0)."""
+    sign, mag = bits & 0x8000, bits & 0x7FFF
+    if mag > HALF_INFINITY:
+        return HALF_NAN
+    if mag == 0:
+        return sign | HALF_INFINITY
+    if mag == HALF_INFINITY:
+        return sign
+    return half_bits(1.0 / bits_half(bits))
+
+
+def half_sqrt(bits):
+    """v_sqrt_f16 (ISA RDNA 2, §12.8, VOP1 85, p. 147) : sqrt(S0.f16) (-0 → -0, négatif non nul → NaN)."""
+    mag = bits & 0x7FFF
+    if mag > HALF_INFINITY:
+        return HALF_NAN
+    if mag == 0:
+        return bits
+    if bits & 0x8000:
+        return HALF_NAN
+    if mag == HALF_INFINITY:
+        return HALF_INFINITY
+    return half_bits(math.sqrt(bits_half(bits)))
+
+
+def half_rsq(bits):
+    """v_rsq_f16 (ISA RDNA 2, §12.8, VOP1 86, p. 147) : 1.0 / sqrt(S0.f16) (±0 → ±inf, +inf → +0)."""
+    sign, mag = bits & 0x8000, bits & 0x7FFF
+    if mag > HALF_INFINITY:
+        return HALF_NAN
+    if mag == 0:
+        return sign | HALF_INFINITY
+    if sign:
+        return HALF_NAN
+    if mag == HALF_INFINITY:
+        return 0
+    return half_bits(1.0 / math.sqrt(bits_half(bits)))
+
+
+def half_log2(bits):
+    """v_log_f16 (ISA RDNA 2, §12.8, VOP1 87, p. 147) : log2(S0.f16) (±0 → -inf, +1 → +0, négatif → NaN)."""
+    mag = bits & 0x7FFF
+    if mag > HALF_INFINITY:
+        return HALF_NAN
+    if mag == 0:
+        return 0x8000 | HALF_INFINITY
+    if bits & 0x8000:
+        return HALF_NAN
+    if mag == HALF_INFINITY:
+        return HALF_INFINITY
+    if bits == HALF_ONE:
+        return 0
+    return half_bits(math.log2(bits_half(bits)))
+
+
+def half_exp2(bits):
+    """v_exp_f16 (ISA RDNA 2, §12.8, VOP1 88, p. 148) : 2 ** S0.f16 (-inf → +0, ±0 → +1, +inf → +inf)."""
+    mag = bits & 0x7FFF
+    if mag > HALF_INFINITY:
+        return HALF_NAN
+    if mag == 0:
+        return HALF_ONE
+    if bits == (0x8000 | HALF_INFINITY):
+        return 0
+    if bits == HALF_INFINITY:
+        return HALF_INFINITY
+    value = bits_half(bits)
+    if value >= 16.0:
+        return HALF_INFINITY
+    if value <= -25.0:
+        return 0
+    return half_bits(2.0 ** value)
+
+
+def half_trig(bits, is_cos):
+    """v_sin_f16 / v_cos_f16 (ISA RDNA 2, §12.8, VOP1 96-97, p. 149) : sin/cos(S0.f16 × 2π), réduction exacte
+    par tours avant la multiplication par 2π (sin(-0) = -0, sin(±65504) = +0, cos(±65504) = +1, cos(0.25) = +0)."""
+    mag = bits & 0x7FFF
+    if mag >= HALF_INFINITY:
+        return HALF_NAN
+    if mag == 0:
+        return HALF_ONE if is_cos else bits
+    value = abs(bits_half(bits))
+    neg = bool(bits & 0x8000) and not is_cos
+    frac = value - math.trunc(value)
+    quadrant = int(math.floor(frac * 4.0))
+    offset = frac - quadrant * 0.25
+    if is_cos:
+        quadrant = (quadrant + 1) & 3
+    if offset == 0.0:
+        if quadrant & 1 == 0:
+            return 0
+        return (0x8000 | HALF_ONE) if ((quadrant == 3) ^ neg) else HALF_ONE
+    if quadrant & 1:
+        offset = 0.25 - offset
+    if offset > 0.125:
+        result = math.cos((0.25 - offset) * math.tau)
+    else:
+        result = math.sin(offset * math.tau)
+    encoded = half_bits(result)
+    return encoded ^ 0x8000 if encoded and ((quadrant >= 2) ^ neg) else encoded
+
+
 H = bits_half
 
 # Opérations f16 : nom → (types des sources src0..src2, fonction(a, b, c, d, k)).
@@ -83,13 +225,35 @@ OPERATIONS = {
     "v_min_f16": ("hh", lambda a, b, c, d, k: half_min(a, b)),
     # Au-delà de ±64, le résultat f16 vaut déjà 0 ou l'infini : borner l'exposant ne change rien.
     "v_ldexp_f16": ("hi", lambda a, b, c, d, k: half_bits(math.ldexp(H(a), max(-64, min(64, signed(b, 16)))))),
+    # ISA RDNA 2, §12.8, opcodes VOP1 91-94 (p. 148) ; round() de Python : au plus proche pair.
+    "v_floor_f16": ("h", lambda a, b, c, d, k: half_round(a, math.floor)),
+    "v_ceil_f16": ("h", lambda a, b, c, d, k: half_round(a, math.ceil)),
+    "v_trunc_f16": ("h", lambda a, b, c, d, k: half_round(a, math.trunc)),
+    "v_rndne_f16": ("h", lambda a, b, c, d, k: half_round(a, round)),
+    # ISA RDNA 2, §12.7, VOP2 47 (p. 135) : D.f16_lo = f32_to_f16(S0), D.f16_hi = f32_to_f16(S1), vers zéro.
+    "v_cvt_pkrtz_f16_f32": ("ww", lambda a, b, c, d, k: half_toward_zero(bits_float(b)) << 16
+                            | half_toward_zero(bits_float(a))),
     "v_cvt_f16_f32": ("w", lambda a, b, c, d, k: half_bits(bits_float(a))),
     "v_cvt_f32_f16": ("h", lambda a, b, c, d, k: FLOAT_NAN if _is_nan(a) else float_bits(H(a))),
+    # ISA RDNA 2, §12.8, opcodes VOP1 89, 90 et 95 (p. 147-148) ; exposant d'un dénormal normalisé comme
+    # le repli constant de LLVM (AMDGPUInstCombineIntrinsic.cpp, amdgcn_frexp_exp : frexp d'APFloat).
+    "v_frexp_mant_f16": ("h", lambda a, b, c, d, k: half_frexp(a)[0]),
+    "v_frexp_exp_i16_f16": ("h", lambda a, b, c, d, k: half_frexp(a)[1] & 0xFFFF),
+    "v_fract_f16": ("h", lambda a, b, c, d, k: half_fract(a)),
+    # ISA RDNA 2, §12.8, opcodes VOP1 84-88 et 96-97 (p. 147-149) : transcendantes f16 (0.51 ULP, dénormaux).
+    "v_rcp_f16": ("h", lambda a, b, c, d, k: half_rcp(a)),
+    "v_sqrt_f16": ("h", lambda a, b, c, d, k: half_sqrt(a)),
+    "v_rsq_f16": ("h", lambda a, b, c, d, k: half_rsq(a)),
+    "v_log_f16": ("h", lambda a, b, c, d, k: half_log2(a)),
+    "v_exp_f16": ("h", lambda a, b, c, d, k: half_exp2(a)),
+    "v_sin_f16": ("h", lambda a, b, c, d, k: half_trig(a, False)),
+    "v_cos_f16": ("h", lambda a, b, c, d, k: half_trig(a, True)),
 }
 # Résultat sur 32 bits (le VGPR entier) ; les autres écrivent une moitié et gardent l'autre.
-WORD_RESULT = frozenset({"v_cvt_f32_f16"})
+WORD_RESULT = frozenset({"v_cvt_f32_f16", "v_cvt_pkrtz_f16_f32"})
 VGPR_FIRST = 256
 EXTENSIONS = frozenset({0xE9, 0xEA, 0xF9, 0xFA})        # src0 de DPP8, DPP8_FI, SDWA, DPP16
+INTEGER_RESULT = frozenset({"v_frexp_exp_i16_f16"})    # entier de 16 bits : le clamp f16 n'a pas de sens
 
 
 def _refuse(message):
@@ -136,6 +300,8 @@ def _check_vop3(name, kinds, fields, literal):
         _refuse(f"{name} : clamp ou omod sur un résultat f32 non pris en charge")
     if fields.omod:
         _refuse(f"{name} : omod sur un résultat f16 non pris en charge")
+    if fields.clamp and name in INTEGER_RESULT:
+        _refuse(f"{name} : clamp sur un résultat entier non mesuré")
     if fields.op_sel and name == "v_fmac_f16":
         _refuse(f"{name} : op_sel non pris en charge en VOP3")
     if fields.op_sel >> 3 & 1 and name in WORD_RESULT:
