@@ -310,7 +310,10 @@ impl Default for LaunchOptions {
     fn default() -> Self {
         LaunchOptions {
             preset: Preset::Fast,
-            resolution: Resolution::Default,
+            // Full HD by default: the title renders at 1280x720 inside instead of 2560x1440
+            // (4K, the size a Series X wrote in its settings). Measured on an RTX 4070 SUPER,
+            // Series X: about 20 fps in the world at 4K, 24-30 at 1080p.
+            resolution: Resolution::P1080,
             custom_width: 1920,
             custom_height: 1080,
             window: WindowMode::Windowed,
@@ -392,8 +395,10 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn the_defaults_set_nothing() {
-        assert!(LaunchOptions::default().env_pairs().is_empty());
+    fn the_defaults_set_only_the_full_hd_size() {
+        let pairs = LaunchOptions::default().env_pairs();
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, [DISPLAY_MODE, OUTPUT], "{pairs:?}");
     }
 
     #[test]
@@ -608,6 +613,12 @@ mod tests {
         assert_eq!(output(Resolution::P720).as_deref(), Some("1280x720"));
         assert_eq!(output(Resolution::P900), None);
         assert_eq!(output(Resolution::Default), None);
+    }
+
+    #[test]
+    fn a_new_launcher_plays_in_full_hd() {
+        let pairs = LaunchOptions::default().env_pairs();
+        assert!(pairs.iter().any(|(k, v)| k == OUTPUT && v == "1920x1080"), "{pairs:?}");
     }
 
 }
