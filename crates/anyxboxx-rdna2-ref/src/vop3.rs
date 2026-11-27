@@ -434,6 +434,10 @@ pub fn execute(
         }
         return crate::movrel::vector(wave, name, fields.vdst, fields.sources[0], literal);
     }
+    if crate::f16conv::supports(name) {
+        crate::f16conv::execute_vop3(wave, name, word, literal)?;
+        return Ok(true);
+    }
     if !is_native(name) {
         return Ok(false);
     }
