@@ -1,7 +1,7 @@
 //! The steps of a launch as reusable pieces: the CLI (`anyxboxx run`) chains them like main's
 //! script did, the graphical launcher (`crates/anyxboxx-launcher`) drives them one by one.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -12,7 +12,8 @@ pub const GAME_EXE: &str = "game_scarlett_master.exe";
 pub const PRECOMPILED_DLLS: [&str; 2] = ["XboxBvhBuilder.dll", "amd_fidelityfx_upscaler_xbox.dll"];
 pub const SHADERS: &str = "shaders.rpf";
 
-/// Environment variables given to VIctory, in the order they are set.
+/// Environment variables applied to the VIctory child process in order.
+/// An empty value removes a VICTORY_* variable from that child.
 pub type Env = Vec<(String, OsString)>;
 
 /// Where VIctory's sources and its built `victory.exe` are. `manifest` is `None` for a
@@ -80,7 +81,7 @@ impl Victory {
         let _ = archives;
         let mut command = Command::new(&self.exe);
         command.arg("warm");
-        command.envs(pairs(env));
+        apply_env(&mut command, env);
         command
     }
 
@@ -98,7 +99,7 @@ impl Victory {
         // fails here, as before, and the command is the plain warm.
         let mut command = Command::new(&self.exe);
         command.arg("warm");
-        command.envs(pairs(env));
+        apply_env(&mut command, env);
         Ok(command)
     }
 
@@ -109,7 +110,7 @@ impl Victory {
             .arg("run")
             .arg(game_dir.join(GAME_EXE))
             .arg("--execute");
-        command.envs(pairs(env));
+        apply_env(&mut command, env);
         command
     }
 }
@@ -138,14 +139,14 @@ pub fn warm_archives(game_dir: &Path) -> Result<Vec<PathBuf>, RunError> {
 /// The game executable of `game_dir`, which must exist.
 pub fn game_exe(game_dir: &Path) -> Result<PathBuf, RunError> {
     let exe = game_dir.join(GAME_EXE);
-    if exe.exists() {
+    if exe.is_file() {
         Ok(exe)
     } else {
         Err(RunError::NoGame(game_dir.display().to_string()))
     }
 }
 
-/// The game's environment, checked like the script (the XG library must exist).
+/// Validate XG and apply explicit overrides after profile values and dedicated switches.
 pub fn environment(args: &RunArgs) -> Result<Env, RunError> {
     let mut env = settings::base(args);
     if let Some(dll) = args.xg_dll.as_deref().filter(|p| !p.as_os_str().is_empty()) {
@@ -156,12 +157,22 @@ pub fn environment(args: &RunArgs) -> Result<Env, RunError> {
             std::path::absolute(dll).map_err(|e| RunError::Spawn(dll.display().to_string(), e))?;
         env.extend(settings::xg(&absolute, args.xg_mode.as_str()));
     }
+    env.extend(
+        args.overrides
+            .iter()
+            .map(|(name, value)| (name.clone(), OsString::from(value))),
+    );
     Ok(env)
 }
 
-fn pairs(env: &Env) -> impl Iterator<Item = (&OsStr, &OsStr)> {
-    env.iter()
-        .map(|(k, v)| (OsStr::new(k.as_str()), v.as_os_str()))
+fn apply_env(command: &mut Command, env: &Env) {
+    for (key, value) in env {
+        if key.starts_with("VICTORY_") && value.is_empty() {
+            command.env_remove(key);
+        } else {
+            command.env(key, value);
+        }
+    }
 }
 
 /// Waits for the command; a process killed without exit code counts as 1, like PowerShell.
