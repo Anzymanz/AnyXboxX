@@ -193,6 +193,46 @@ def test_fixed_vector_programs_match_the_python_model():
         assert_same(exe, lanes, scc, scalars, words)
 
 
+# Operand values of the unfused multiply-add test: a finite value, +inf, +0, and a NaN whose payload
+# names its position (0A, 0B, 0C), so that the NaN that comes out says which operand it was.
+MUL_ADD_NANS = (0x7FC0_0A0A, 0x7FC0_0B0B, 0x7FC0_0C0C)
+MUL_ADD_VALUES = (0x3FC0_0000, 0x7F80_0000, 0x0000_0000)
+
+
+def mul_add_programs():
+    """(name, words) of every unfused multiply-add form with each operand position finite, infinite, zero
+    or NaN. The model's `_mul_add` keeps the NaN of the product (a factor, or ∞ × 0) before a NaN addend."""
+    load = lambda register, bits: [vop1("v_mov_b32", register, LITERAL), bits]
+    programs = []
+    for first in (*MUL_ADD_VALUES, MUL_ADD_NANS[0]):
+        for second in (*MUL_ADD_VALUES, MUL_ADD_NANS[1]):
+            for third in (*MUL_ADD_VALUES, MUL_ADD_NANS[2]):
+                registers = load(1, first) + load(2, second) + load(3, third)
+                programs += [
+                    ("v_mad_f32", program(*registers, *vop3("v_mad_f32", 4, (V0 + 1, V0 + 2, V0 + 3)))),
+                    ("v_mac_f32", program(*registers, vop2("v_mac_f32", 3, V0 + 1, 2))),
+                    ("v_mac_f32 (VOP3)", program(*registers, *vop3("v_mac_f32", 3, (V0 + 1, V0 + 2, 128)))),
+                    ("v_madak_f32", program(*load(1, first) + load(2, second), vop2("v_madak_f32", 4, V0 + 1, 2), third)),
+                    ("v_madmk_f32", program(*load(1, first) + load(2, third), vop2("v_madmk_f32", 4, V0 + 1, 2), second)),
+                ]
+    return programs
+
+
+def test_unfused_multiply_add_nans_match_the_python_model():
+    """v_mad_f32, v_mac_f32 (VOP2 and VOP3), v_madak_f32 and v_madmk_f32 on every mix of finite, infinite,
+    zero and NaN operands: the same NaN as the model, which keeps the product's NaN before the addend's."""
+    exe = binary()
+    for _, words in mul_add_programs():
+        assert_same(exe, 32, False, [], words)
+    # The values themselves, so that two models wrong in the same way cannot pass.
+    madak = program(vop1("v_mov_b32", 1, LITERAL), 0x3FC0_0000, vop1("v_mov_b32", 2, LITERAL), MUL_ADD_NANS[1],
+                    vop2("v_madak_f32", 4, V0 + 1, 2), MUL_ADD_NANS[2])
+    assert "\nv 4 7FC00B0B" in run_python(32, False, [], madak)
+    infinity_times_zero = program(vop1("v_mov_b32", 1, LITERAL), 0x7F80_0000, vop1("v_mov_b32", 3, LITERAL),
+                                  MUL_ADD_NANS[2], *vop3("v_mad_f32", 4, (V0 + 1, V0 + 2, V0 + 3)))
+    assert "\nv 4 FFC00000" in run_python(32, False, [], infinity_times_zero)
+
+
 def test_a_literal_operand_is_the_second_word_in_both_models():
     exe = binary()
     words = program(sop1("s_mov_b32", 0, 255), 0xDEAD_BEEF, sop2("s_xor_b32", 1, 0, 255), 0x0F0F_0F0F)
